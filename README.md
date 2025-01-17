@@ -57,6 +57,7 @@ Commands:
   update  - Update par2 files if target has changed
   clear   - Remove all par2 files
   stats   - Show protection coverage statistics
+  test    - Run the test suite
 ```
 
 ## Environment Variables
@@ -64,6 +65,7 @@ Commands:
 - `NUM_PAR2_THREADS`: Number of threads for par2 (default: CPU core count)
 - `BRG_REDUNDANCY`: Percentage of redundancy (default: 5)
 - `PROTECT_DOTFILES`: Whether to protect hidden files (default: 1)
+- `DEBUG`: Set to 1 to enable verbose debug output
 
 ## How It Works
 
