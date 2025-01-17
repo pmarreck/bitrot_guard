@@ -22,7 +22,7 @@ The "proper" solution for bitrot protection is to use an advanced file system li
 
 ## How bitrot_guard Helps
 
-This tool provides a middle ground: bitrot protection for long-term archival without requiring full redundancy or filesystem changes. Key features:
+This tool provides a middle ground: bitrot protection for long-term archiving without requiring full redundancy or filesystem changes. Key features:
 
 - Uses par2 to create error-correction data for files and directories
 - Default 5% redundancy (configurable up to 100%)
@@ -32,6 +32,18 @@ This tool provides a middle ground: bitrot protection for long-term archival wit
 - Special handling for macOS resource forks
 - Detects AND repairs corruption
 - Efficient updates based on modification times
+
+## Requirements
+
+- `par2` command line tool (available via most package managers)
+- Bash shell 4.2+
+- The GNU version of standard Unix utilities (`find`, `stat`, etc.)
+
+## Platform Support
+
+- macOS (full support, including resource fork handling)
+- Linux (full support, except resource fork handling)
+- WSL (should work but untested)
 
 ## Usage
 
