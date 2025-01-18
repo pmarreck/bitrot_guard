@@ -242,6 +242,8 @@ process_single_file() {
 	local operation="$2"
 	local file_dir
 	file_dir=$(dirname "$file")
+	local dir_time
+	dir_time=$($STAT -c%Y "$file_dir")
 	local base_name
 	base_name=$(basename "$file")
 	local par2_file
@@ -288,6 +290,13 @@ process_single_file() {
 				return 1
 			fi
 			
+			# Set the par2 files' timestamps to match the original file
+			local file_time
+			file_time=$($STAT -c%Y "$file")
+			for par2f in "${par2_file}"*; do
+				$TOUCH --no-dereference --reference="$file" "$par2f"
+			done
+			
 			debug "Par2 file created: $(ls "${par2_file}"*)"
 			if $has_rf; then
 				debug "Creating par2 for resource fork: $resource_fork_path"
@@ -308,9 +317,14 @@ process_single_file() {
 
 				rm "$temp_resource_fork_path"
 				debug "Par2 file created: $resource_fork_par2_file"
+				# Set resource fork par2 files' timestamps to match the resource fork
+				for par2f in "${resource_fork_par2_file}"*; do
+					$TOUCH --no-dereference --reference="$resource_fork_path" "$par2f"
+				done
 			fi
 
-			echo " - Done."
+			echo "$file - Done."
+			$TOUCH -d @"$dir_time" "$file_dir"
 			;;
 
 		verify)
@@ -337,6 +351,7 @@ process_single_file() {
 				debug "Resource fork verification successful"
 				rm "$temp_resource_fork_path"
 			fi
+			$TOUCH -d @"$dir_time" "$file_dir"
 			;;
 
 		repair)
@@ -381,11 +396,13 @@ process_single_file() {
 
 			debug "Directory contents after repair: $(ls -la "$file_dir")"
 			debug "File content after repair: $(cat "$file")"
-			echo " - Done."
+			echo "$file - Done."
+			$TOUCH -d @"$dir_time" "$file_dir"
 			;;
 
 		clear)
 			remove_par2_files_for_file "$file"
+			$TOUCH -d @"$dir_time" "$file_dir"
 			;;
 
 		update)
@@ -1058,7 +1075,7 @@ test_suite() {
 		test_error "repair_par2s did not restore original file content"
 		((test_fails++))
 	else
-		test_debug "Repair succeeded, demonstrating par2's resilience to corruption"
+		test_debug "Repair of $test_dir/corrupt_test.txt succeeded, demonstrating par2's resilience to corruption"
 	fi
 	
 	# Test corrupted par2 data with intact original file
@@ -1216,10 +1233,8 @@ test_corruption_patterns() {
 	if ((test_fails > 0)); then
 		test_error "Corruption pattern tests failed: $test_fails"
 		return $test_fails
-	else
-		test_debug "All corruption pattern tests passed!"
-		return 0
 	fi
+	return 0
 }
 
 test_dotfile_handling() {
@@ -1268,10 +1283,8 @@ test_dotfile_handling() {
 	if ((test_fails > 0)); then
 		test_error "Dotfile handling tests failed: $test_fails"
 		return $test_fails
-	else
-		test_debug "All dotfile handling tests passed!"
-		return 0
 	fi
+	return 0
 }
 
 test_resource_fork_handling() {
@@ -1370,45 +1383,104 @@ test_resource_fork_handling() {
 	return "$test_fails"
 }
 
-test_all() {
-	local total_fails=0
-	local test_fails
+test_timestamp_and_output() {
+	local test_dir
+	test_dir=$(mktemp -d)
+	trap 'rm -rf "$test_dir"' EXIT
 
+	# Create a test file with known timestamp
+	local test_file="$test_dir/test.txt"
+	echo "test content" > "$test_file"
+	local test_time="202501010000.00"  # Jan 1, 2025 midnight
+	$TOUCH -t "$test_time" "$test_file"
+	local orig_time
+	orig_time=$($STAT -c%Y "$test_file")
+
+	# Capture output while creating par2
+	local output
+	output=$(process_single_file "$test_file" create)
+
+	# Test 1: Output format should include the filename
+	if [[ "$output" != *"$test_file"* ]]; then
+		test_error "Output '$output' does not contain filename '$test_file'"
+		return 1
+	fi
+
+	# Test 2: Par2 file should exist and have same timestamp as original
+	local par2_file
+	par2_file=$(get_par2_path "$test_file")
+	if [[ ! -f "$par2_file" ]]; then
+		test_error "Par2 file $par2_file not created"
+		return 1
+	fi
+	local par2_time
+	par2_time=$($STAT -c%Y "$par2_file")
+	if [[ "$par2_time" != "$orig_time" ]]; then
+		test_error "Par2 file timestamp ($par2_time) does not match original ($orig_time)"
+		return 1
+	fi
+
+	# Test 3: Parent directory timestamp should be preserved
+	local dir_time_before
+	dir_time_before=$($STAT -c%Y "$test_dir")
+	process_single_file "$test_file" create >/dev/null
+	local dir_time_after
+	dir_time_after=$($STAT -c%Y "$test_dir")
+	if [[ "$dir_time_before" != "$dir_time_after" ]]; then
+		test_error "Directory timestamp changed from $dir_time_before to $dir_time_after"
+		return 1
+	fi
+
+	test_debug "All timestamp and output tests passed"
+	return 0
+}
+
+test_all() {
+	local failed=0
+	
+	test_debug "Running all tests..."
+	
+	test_suite || ((failed++))
+	test_corruption_patterns || ((failed++))
+	test_dotfile_handling || ((failed++))
+	test_resource_fork_handling || ((failed++))
+	test_timestamp_and_output || ((failed++))
+	
+	if ((failed > 0)); then
+		test_error "$failed test suite(s) failed"
+		return 1
+	fi
+	return 0
+}
+
+test_all() {
+	local failed=0
+	
 	# Redirect all output to /dev/null unless DEBUG is set
 	if ! debug_mode; then
 		exec 3>&1 4>&2  # Save original stdout/stderr
 		# Pipe all output through grep to only show TEST ERROR/DEBUG lines
-		exec 1> >(grep "^(TEST ERROR|TEST DEBUG):" || true) 2>&1
+		exec 1> >(grep "^TEST \(ERROR\|DEBUG\):" || true) 2>&1
 	fi
-
-	test_suite
-	test_fails=$?
-	((total_fails += test_fails))
-
-	test_dotfile_handling
-	test_fails=$?
-	((total_fails += test_fails))
-
-	test_resource_fork_handling
-	test_fails=$?
-	((total_fails += test_fails))
-
-	test_corruption_patterns
-	test_fails=$?
-	((total_fails += test_fails))
-
+	
+	test_debug "Running all tests..."
+	
+	test_suite || ((failed++))
+	test_corruption_patterns || ((failed++))
+	test_dotfile_handling || ((failed++))
+	test_resource_fork_handling || ((failed++))
+	test_timestamp_and_output || ((failed++))
+	
 	# Restore original stdout/stderr if we redirected them
 	if ! debug_mode; then
 		exec 1>&3 2>&4
 	fi
-
-	if ((total_fails == 0)); then
-		echo "All tests passed"
-	else
-		echo "Tests failed: $total_fails"
+	
+	if ((failed > 0)); then
+		test_error "$failed test suite(s) failed"
+		return 1
 	fi
-
-	return "$total_fails"
+	return 0
 }
 
 # Main execution (if script is run directly)
