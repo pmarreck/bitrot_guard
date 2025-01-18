@@ -293,15 +293,13 @@ process_single_file() {
 			# Set the par2 files' timestamps to match the original file
 			local file_time
 			file_time=$($STAT -c%Y "$file") # NOTE: this is expected to be GNU stat!
-			local par2_pattern
-			par2_pattern="$(dirname "$par2_file")/.$(basename "$file")*.par2"
-			debug "Setting timestamp $file_time on par2 files matching $par2_pattern"
-			for par2f in $par2_pattern; do
+			debug "Setting timestamp $file_time on par2 files"
+			for par2f in "${par2_file%.*}".vol*.par2 "${par2_file%.*}".par2; do
 				debug "Setting timestamp on: $par2f"
 				$TOUCH -h --date="@$file_time" "$par2f"
 			done
 			
-			debug "Par2 file created: $(ls -la "$par2_pattern")"
+			debug "Par2 file created: $(ls -la $par2_pattern)"
 			if $has_rf; then
 				debug "Creating par2 for resource fork: $resource_fork_path"
 				debug "Resource fork par2 file will be: $resource_fork_par2_file"
@@ -324,7 +322,7 @@ process_single_file() {
 				# Set resource fork par2 files' timestamps to match the resource fork
 				local rsrc_time
 				rsrc_time=$($STAT -c%Y "$resource_fork_path")
-				for par2f in "${resource_fork_par2_file}"*; do
+				for par2f in "${resource_fork_par2_file%.*}".vol*.par2 "${resource_fork_par2_file%.*}".par2; do
 					$TOUCH -h --date="@$rsrc_time" "$par2f"
 				done
 			fi
@@ -1427,14 +1425,8 @@ test_timestamp_and_output() {
 		test_error "Par2 file $par2_file not created"
 		return 1
 	fi
-	local par2_time
-	par2_time=$($STAT -c%Y "$par2_file")
-	if [[ "$par2_time" != "$orig_time" ]]; then
-		test_error "Par2 file timestamp ($par2_time) does not match original ($orig_time)"
-		return 1
-	fi
-
 	# Check main par2 file timestamp
+	local par2_time
 	par2_time=$($STAT -c%Y "$par2_file")
 	if [[ "$par2_time" != "$orig_time" ]]; then
 		test_error "Par2 file timestamp ($par2_time) does not match original ($orig_time)"
