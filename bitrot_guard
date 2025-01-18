@@ -292,12 +292,16 @@ process_single_file() {
 			
 			# Set the par2 files' timestamps to match the original file
 			local file_time
-			file_time=$($STAT -c%Y "$file")
-			for par2f in "${par2_file}"*; do
-				$TOUCH --no-dereference --reference="$file" "$par2f"
+			file_time=$($STAT -c%Y "$file") # NOTE: this is expected to be GNU stat!
+			local par2_pattern
+			par2_pattern="$(dirname "$par2_file")/.$(basename "$file")*.par2"
+			debug "Setting timestamp $file_time on par2 files matching $par2_pattern"
+			for par2f in $par2_pattern; do
+				debug "Setting timestamp on: $par2f"
+				$TOUCH -h --date="@$file_time" "$par2f"
 			done
 			
-			debug "Par2 file created: $(ls "${par2_file}"*)"
+			debug "Par2 file created: $(ls -la "$par2_pattern")"
 			if $has_rf; then
 				debug "Creating par2 for resource fork: $resource_fork_path"
 				debug "Resource fork par2 file will be: $resource_fork_par2_file"
@@ -318,13 +322,15 @@ process_single_file() {
 				rm "$temp_resource_fork_path"
 				debug "Par2 file created: $resource_fork_par2_file"
 				# Set resource fork par2 files' timestamps to match the resource fork
+				local rsrc_time
+				rsrc_time=$($STAT -c%Y "$resource_fork_path")
 				for par2f in "${resource_fork_par2_file}"*; do
-					$TOUCH --no-dereference --reference="$resource_fork_path" "$par2f"
+					$TOUCH -h --date="@$rsrc_time" "$par2f"
 				done
 			fi
 
 			echo "$file - Done."
-			$TOUCH -d @"$dir_time" "$file_dir"
+			$TOUCH -h --date="@$dir_time" "$file_dir"
 			;;
 
 		verify)
@@ -351,7 +357,7 @@ process_single_file() {
 				debug "Resource fork verification successful"
 				rm "$temp_resource_fork_path"
 			fi
-			$TOUCH -d @"$dir_time" "$file_dir"
+			$TOUCH -h --date="@$dir_time" "$file_dir"
 			;;
 
 		repair)
@@ -397,12 +403,12 @@ process_single_file() {
 			debug "Directory contents after repair: $(ls -la "$file_dir")"
 			debug "File content after repair: $(cat "$file")"
 			echo "$file - Done."
-			$TOUCH -d @"$dir_time" "$file_dir"
+			$TOUCH -h --date="@$dir_time" "$file_dir"
 			;;
 
 		clear)
 			remove_par2_files_for_file "$file"
-			$TOUCH -d @"$dir_time" "$file_dir"
+			$TOUCH -h --date="@$dir_time" "$file_dir"
 			;;
 
 		update)
@@ -1390,23 +1396,31 @@ test_timestamp_and_output() {
 
 	# Create a test file with known timestamp
 	local test_file="$test_dir/test.txt"
-	echo "test content" > "$test_file"
+	# Create a 1MB file to ensure par2 creates vol files
+	dd if=/dev/urandom of="$test_file" bs=1M count=1 2>/dev/null
 	local test_time="202501010000.00"  # Jan 1, 2025 midnight
 	$TOUCH -t "$test_time" "$test_file"
 	local orig_time
 	orig_time=$($STAT -c%Y "$test_file")
 
+	# Override block size and redundancy for testing to force vol file creation
+	local old_redundancy=$BRG_REDUNDANCY
+	BRG_REDUNDANCY=20  # Higher redundancy = more vol files
+	
 	# Capture output while creating par2
 	local output
 	output=$(process_single_file "$test_file" create)
-
+	
+	# Restore original redundancy
+	BRG_REDUNDANCY=$old_redundancy
+	
 	# Test 1: Output format should include the filename
 	if [[ "$output" != *"$test_file"* ]]; then
 		test_error "Output '$output' does not contain filename '$test_file'"
 		return 1
 	fi
 
-	# Test 2: Par2 file should exist and have same timestamp as original
+	# Test 2: Par2 files should exist and have same timestamp as original
 	local par2_file
 	par2_file=$(get_par2_path "$test_file")
 	if [[ ! -f "$par2_file" ]]; then
@@ -1419,6 +1433,27 @@ test_timestamp_and_output() {
 		test_error "Par2 file timestamp ($par2_time) does not match original ($orig_time)"
 		return 1
 	fi
+
+	# Check main par2 file timestamp
+	par2_time=$($STAT -c%Y "$par2_file")
+	if [[ "$par2_time" != "$orig_time" ]]; then
+		test_error "Par2 file timestamp ($par2_time) does not match original ($orig_time)"
+		return 1
+	fi
+
+	# Check vol file timestamps
+	for volfile in "${par2_file%.*}".vol*.par2; do
+		if [[ ! -f "$volfile" ]]; then
+			test_error "Expected vol file $volfile not found"
+			return 1
+		fi
+		local vol_time
+		vol_time=$($STAT -c%Y "$volfile")
+		if [[ "$vol_time" != "$orig_time" ]]; then
+			test_error "Vol file $volfile timestamp ($vol_time) does not match original ($orig_time)"
+			return 1
+		fi
+	done
 
 	# Test 3: Parent directory timestamp should be preserved
 	local dir_time_before
