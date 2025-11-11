@@ -4,6 +4,7 @@
 # set -euo pipefail
 
 IFS=$'\n\t'
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 # Get number of CPU cores based on OS
 get_cpu_cores() {
@@ -14,10 +15,95 @@ get_cpu_cores() {
 	fi
 }
 
+is_macos() {
+	[[ "$OSTYPE" == "darwin"* ]]
+}
+
+realpath_supported() {
+	if command -v greadlink >/dev/null 2>&1; then
+		return 0
+	fi
+	if command -v readlink >/dev/null 2>&1; then
+		return 0
+	fi
+	return 1
+}
+
+resolve_realpath_with_readlink() {
+	local target="$1"
+	local current="$target"
+	local max_symlinks=40
+
+	if [[ ! "$current" =~ ^/ ]]; then
+		current="$PWD/$current"
+	fi
+
+	while ((max_symlinks--)); do
+		if [[ -L "$current" ]]; then
+			local link
+			if ! link=$(readlink "$current"); then
+				return 1
+			fi
+			if [[ "$link" == /* ]]; then
+				current="$link"
+			else
+				current="$(dirname "$current")/$link"
+			fi
+			continue
+		fi
+
+		if [[ -d "$current" ]]; then
+			( cd "$current" 2>/dev/null && pwd -P )
+			return $?
+		fi
+
+		if [[ -e "$current" ]]; then
+			local dir
+			dir=$(dirname "$current")
+			local base
+			base=$(basename "$current")
+			if ! dir=$(cd "$dir" 2>/dev/null && pwd -P); then
+				return 1
+			fi
+			printf '%s/%s\n' "$dir" "$base"
+			return 0
+		fi
+
+		return 1
+	done
+
+	return 1
+}
+
+resolve_realpath() {
+	local target="$1"
+	local resolved
+
+	if command -v greadlink >/dev/null 2>&1; then
+		if resolved=$(greadlink -f "$target" 2>/dev/null); then
+			printf '%s\n' "$resolved"
+			return 0
+		fi
+	fi
+
+	if command -v readlink >/dev/null 2>&1; then
+		if resolved=$(resolve_realpath_with_readlink "$target"); then
+			printf '%s\n' "$resolved"
+			return 0
+		fi
+	fi
+
+	return 1
+}
+
 # Set number of par2 threads, allowing override via environment variable
 : "${NUM_PAR2_THREADS:=$(get_cpu_cores)}"
 BRG_REDUNDANCY=${BRG_REDUNDANCY:-5}
 PROTECT_DOTFILES=${PROTECT_DOTFILES:-1}
+PROJECT_DESCRIPTION="Bitrot Guard creates and uses par2 redundancy to detect and repair bitrot in your files and directories."
+declare -a DEFAULT_IGNORE_PATTERNS=(".git" ".git/**" "**/.git/**" ".jj" ".jj/**" "**/.jj/**")
+BRG_IGNORE_PATTERNS_LOADED=0
+declare -a BRG_IGNORE_PATTERNS_CACHE=()
 
 # Warn if redundancy is set too high
 if ((BRG_REDUNDANCY > 20)); then
@@ -49,6 +135,9 @@ check_dependencies() {
 	# warn if par2 missing
 	if [ -z "$PAR2" ]; then
 		missing+=("par2")
+	fi
+	if ! realpath_supported; then
+		missing+=("greadlink (coreutils) or readlink")
 	fi
 	if [[ "${#missing[@]}" > 0 ]]; then
 		cat >&2 <<EOF
@@ -85,9 +174,82 @@ sanitize_filename() {
 	echo "$filename" | $SED -E 's/[*?]/_/g; s/:/_/g; s/\\/_/g'
 }
 
-# Check if we're on macOS
-is_macos() {
-	[[ "$OSTYPE" == "darwin"* ]]
+reset_ignore_patterns_cache() {
+	BRG_IGNORE_PATTERNS_CACHE=()
+	BRG_IGNORE_PATTERNS_LOADED=0
+}
+
+load_ignore_patterns() {
+	if [[ "$BRG_IGNORE_PATTERNS_LOADED" -eq 1 ]]; then
+		return
+	fi
+
+	local patterns=("${DEFAULT_IGNORE_PATTERNS[@]}")
+	if [[ -n "${BRG_IGNORE_PATTERNS:-}" ]]; then
+		IFS=':' read -r -a env_patterns <<< "$BRG_IGNORE_PATTERNS"
+		for pattern in "${env_patterns[@]}"; do
+			[[ -z "$pattern" ]] && continue
+			patterns+=("$pattern")
+		done
+	fi
+
+	local config_dir="${XDG_CONFIG_HOME:-$HOME/.config}"
+	local config_file="$config_dir/bitrot_guard/ignore"
+	if [[ -f "$config_file" ]]; then
+		while IFS= read -r line || [[ -n "$line" ]]; do
+			line="${line%%#*}"
+			line="${line%"${line##*[![:space:]]}"}"
+			line="${line#"${line%%[![:space:]]*}"}"
+			[[ -z "$line" ]] && continue
+			patterns+=("$line")
+		done < "$config_file"
+	fi
+
+	BRG_IGNORE_PATTERNS_CACHE=("${patterns[@]}")
+	BRG_IGNORE_PATTERNS_LOADED=1
+}
+
+should_ignore_path() {
+	local path="$1"
+	local root="${2:-}"
+	load_ignore_patterns
+
+	local rel_path="$path"
+	local normalized_root="$root"
+	if [[ -n "$normalized_root" && "$normalized_root" != "/" ]]; then
+		normalized_root="${normalized_root%/}"
+		[[ -z "$normalized_root" ]] && normalized_root="$root"
+	fi
+
+	if [[ -z "$normalized_root" ]]; then
+		normalized_root="$root"
+	fi
+
+	if [[ -n "$normalized_root" ]]; then
+		if [[ "$normalized_root" == "." ]]; then
+			if [[ "$rel_path" == ./* ]]; then
+				rel_path="${rel_path#./}"
+			fi
+		else
+			if [[ "$rel_path" == "$normalized_root" ]]; then
+				rel_path=$(basename "$rel_path")
+			elif [[ "$rel_path" == "$normalized_root"/* ]]; then
+				rel_path="${rel_path#"$normalized_root"/}"
+			fi
+		fi
+	fi
+
+	local base
+	base=$(basename "$path")
+	for pattern in "${BRG_IGNORE_PATTERNS_CACHE[@]}"; do
+		[[ -z "$pattern" ]] && continue
+		if [[ "$rel_path" == $pattern || "$path" == $pattern || "$base" == $pattern ]]; then
+			debug "Ignoring $path (relative: $rel_path) via pattern $pattern"
+			return 0
+		fi
+	done
+
+	return 1
 }
 
 # Check if a file has a resource fork
@@ -153,7 +315,10 @@ get_abs_directory() {
 	local abs_directory
 	# Check if directory exists	
 	# resolve it to an absolute path
-	abs_directory=$(readlink -f "$directory")
+	if ! abs_directory=$(resolve_realpath "$directory"); then
+		echo "Error: Unable to resolve absolute path for '$directory'. Ensure greadlink (GNU coreutils) or perl is installed." >&2
+		return 1
+	fi
 	if [[ ! -d "$abs_directory" ]]; then
 		echo "Error: Directory '$directory' does not exist" >&2
 		return 1
@@ -217,6 +382,7 @@ calculate_block_size() {
 # Function to check if a file should be processed
 should_process_file() {
 	local file="$1"
+	local root="${2:-}"
 	local basename
 	basename=$(basename "$file")
 	
@@ -229,6 +395,10 @@ should_process_file() {
 	if [[ "$PROTECT_DOTFILES" != "1" && "$basename" == .* ]]; then
 		return 1
 	fi
+
+	if should_ignore_path "$file" "$root"; then
+		return 1
+	fi
 	
 	return 0
 }
@@ -236,10 +406,11 @@ should_process_file() {
 # Process a single file for par2 operations
 process_single_file() {
 	local file="$1"
-	if ! should_process_file "$file"; then
+	local operation="$2"
+	local root="${3:-}"
+	if ! should_process_file "$file" "$root"; then
 		return 0
 	fi
-	local operation="$2"
 	local file_dir
 	file_dir=$(dirname "$file")
 	local dir_time
@@ -337,7 +508,11 @@ process_single_file() {
 			debug "Using par2 file: $par2_file"
 			debug "PAR2 command: $PAR2 verify \"$par2_file\" \"$file\""
 			if ! $PAR2 verify "$par2_file" "$file" >/dev/null; then
-				echo "Verification failed for $(readlink -f "$file")" >&2
+				local canonical
+				if ! canonical=$(resolve_realpath "$file"); then
+					canonical="$file"
+				fi
+				echo "Verification failed for $canonical" >&2
 				return 1
 			fi
 
@@ -348,7 +523,11 @@ process_single_file() {
 				debug "Created temporary file to hold resource fork: $temp_resource_fork_path"
 				debug "Verifying resource fork"
 				if ! $PAR2 verify "${temp_resource_fork_path}.par2" >/dev/null; then
-					echo "Resource fork verification failed for $(readlink -f "$file")" >&2
+					local rf_canonical
+					if ! rf_canonical=$(resolve_realpath "$file"); then
+						rf_canonical="$file"
+					fi
+					echo "Resource fork verification failed for $rf_canonical" >&2
 					rm "$temp_resource_fork_path"
 					return 1
 				fi
@@ -411,7 +590,7 @@ process_single_file() {
 
 		update)
 			if [[ ! -f "$par2_file" ]]; then
-				process_single_file "$file" create
+				process_single_file "$file" create "$root"
 				return $?
 			fi
 
@@ -442,8 +621,8 @@ process_single_file() {
 
 			if [[ $needs_update -eq 1 ]]; then
 				debug "File or resource fork is newer, regenerating"
-				process_single_file "$file" clear
-				process_single_file "$file" create
+				process_single_file "$file" clear "$root"
+				process_single_file "$file" create "$root"
 				return $?
 			fi
 			;;
@@ -482,7 +661,7 @@ create_par2s() {
 	
 	if [[ -f "$target" ]]; then
 		debug "Target is a file, calling process_single_file $target create"
-		process_single_file "$target" create
+		process_single_file "$target" create "$(dirname "$target")"
 		return $?
 	fi
 	
@@ -491,10 +670,14 @@ create_par2s() {
 		return 1
 	fi
 	
-	find "$target" -type f -not -name "*.par2" | while read -r file; do
+	while IFS= read -r -d '' file; do
+		if should_ignore_path "$file" "$target"; then
+			debug "Skipping ignored path during create: $file"
+			continue
+		fi
 		debug "Creating protection for $file in directory: $target"
-		process_single_file "$file" create
-	done
+		process_single_file "$file" create "$target"
+	done < <(find "$target" -type f -not -name "*.par2" -print0)
 }
 
 # Update par2 files
@@ -504,9 +687,11 @@ update_par2s() {
 	debug "Attempting update on target: $target"
 	
 	if [[ -f "$target" ]]; then
-		if should_process_file "$target"; then
+		local file_root
+		file_root=$(dirname "$target")
+		if should_process_file "$target" "$file_root"; then
 			debug "Target is a file, calling process_single_file $target update"
-			process_single_file "$target" update
+			process_single_file "$target" update "$file_root"
 			return $?
 		else
 			debug "Target $target is a file, but should not be processed, skipping"
@@ -522,18 +707,22 @@ update_par2s() {
 	echo "Scanning for par2 files in $target..."
 	
 	# Count total par2 files that are not resource fork par2 files for progress indication
-	local total_par2_files par2_files
-	par2_files=$(find "$target" -type f -not -name ".*.rsrc.par2" -name ".*.par2" )
-	total_par2_files=$(echo "$par2_files" | wc -l | tr -d ' ')
+	local total_par2_files
+	total_par2_files=$(find "$target" -type f -not -name ".*.rsrc.par2" -name ".*.par2" -print0 | tr -cd '\0' | wc -c | $AWK '{print $1}')
 	echo "Found $total_par2_files par2 files to check"
 	
 	# First, remove orphaned par2 files and their associated volume files
 	local processed_files=0
 	local par2_dir par2_base orig_base
-	echo "$par2_files" | while read -r par2_file; do
+	while IFS= read -r -d '' par2_file; do
 		processed_files=$((processed_files + 1))
 		if ((processed_files % 100 == 0)); then
 			echo "Checking par2 files... ($processed_files/$total_par2_files)"
+		fi
+
+		if should_ignore_path "$par2_file" "$target"; then
+			debug "Skipping ignored par2 file: $par2_file"
+			continue
 		fi
 		
 		par2_dir=$(dirname "$par2_file")
@@ -567,7 +756,7 @@ update_par2s() {
 				rm "$par2_dir/.$orig_base.par2" "$par2_dir/.$orig_base.rsrc.par2" "$par2_dir/.$orig_base.vol"* 2>/dev/null || true
 			fi
 		fi
-	done
+	done < <(find "$target" -type f -not -name ".*.rsrc.par2" -name ".*.par2" -print0)
 	
 	echo "par2 file check complete"
 	echo "Scanning for files needing par2 updates..."
@@ -575,16 +764,16 @@ update_par2s() {
 	# Count total files for progress indication, excluding dotfiles if not protected
 	local total_files
 	if [[ "$PROTECT_DOTFILES" == "1" ]]; then
-		total_files=$(find "$target" -type f -not -name "*.par2" | wc -l | tr -d ' ')
+		total_files=$(find "$target" -type f -not -name "*.par2" -print0 | tr -cd '\0' | wc -c | $AWK '{print $1}')
 	else
-		total_files=$(find "$target" -type f -not -name ".*" -not -name "*.par2" | wc -l | tr -d ' ')
+		total_files=$(find "$target" -type f -not -name ".*" -not -name "*.par2" -print0 | tr -cd '\0' | wc -c | $AWK '{print $1}')
 	fi
 	echo "Found $total_files files to process"
 	
 	# Then update/create par2 files as needed
 	processed_files=0
-	find "$target" -type f -not -name "*.par2" | while read -r file; do
-		if ! should_process_file "$file"; then
+	while IFS= read -r -d '' file; do
+		if ! should_process_file "$file" "$target"; then
 			continue
 		fi
 		processed_files=$((processed_files + 1))
@@ -592,8 +781,8 @@ update_par2s() {
 			echo "Processing files... ($processed_files/$total_files)"
 		fi
 		debug "Updating file: $file"
-		process_single_file "$file" update
-	done
+		process_single_file "$file" update "$target"
+	done < <(find "$target" -type f -not -name "*.par2" -print0)
 	
 	echo "Update complete"
 }
@@ -607,7 +796,7 @@ verify_par2s() {
 	
 	if [[ -f "$target" ]]; then
 		debug "Target is a file, calling process_single_file $target verify"
-		process_single_file "$target" verify
+		process_single_file "$target" verify "$(dirname "$target")"
 		return $?
 	fi
 	
@@ -617,12 +806,16 @@ verify_par2s() {
 	fi
 	
 	debug "Target is a directory, processing files recursively"
-	find "$target" -type f -not -name "*.par2" | while read -r file; do
+	while IFS= read -r -d '' file; do
+		if should_ignore_path "$file" "$target"; then
+			debug "Skipping ignored path during verify: $file"
+			continue
+		fi
 		debug "Verifying protection for file: $file"
-		if ! process_single_file "$file" verify; then
+		if ! process_single_file "$file" verify "$target"; then
 			exit_code=1
 		fi
-	done
+	done < <(find "$target" -type f -not -name "*.par2" -print0)
 	
 	return $exit_code
 }
@@ -636,7 +829,7 @@ repair_par2s() {
 	
 	if [[ -f "$target" ]]; then
 		debug "Target is a file, calling process_single_file $target repair"
-		process_single_file "$target" repair
+		process_single_file "$target" repair "$(dirname "$target")"
 		return $?
 	fi
 	
@@ -646,12 +839,16 @@ repair_par2s() {
 	fi
 	
 	debug "Target is a directory, processing files recursively"
-	find "$target" -type f -not -name "*.par2" | while read -r file; do
+	while IFS= read -r -d '' file; do
+		if should_ignore_path "$file" "$target"; then
+			debug "Skipping ignored path during repair: $file"
+			continue
+		fi
 		debug "Repairing file if necessary: $file"
-		if ! process_single_file "$file" repair; then
+		if ! process_single_file "$file" repair "$target"; then
 			exit_code=1
 		fi
-	done
+	done < <(find "$target" -type f -not -name "*.par2" -print0)
 	
 	return $exit_code
 }
@@ -664,7 +861,7 @@ clear_par2s() {
 	
 	if [[ -f "$target" ]]; then
 		debug "Target is a file, calling process_single_file $target clear"
-		process_single_file "$target" clear
+		process_single_file "$target" clear "$(dirname "$target")"
 		return $?
 	fi
 	
@@ -674,10 +871,14 @@ clear_par2s() {
 	fi
 	
 	debug "Target $target is a directory, processing files recursively"
-	find "$target" -type f -name "*.par2" | while read -r par2_file; do
+	while IFS= read -r -d '' par2_file; do
+		if should_ignore_path "$par2_file" "$target"; then
+			debug "Skipping removal inside ignored path: $par2_file"
+			continue
+		fi
 		echo "Removing: $par2_file"
 		rm "$par2_file"
-	done
+	done < <(find "$target" -type f -name "*.par2" -print0)
 }
 
 # Calculate par2 coverage statistics
@@ -690,8 +891,9 @@ stats_par2s() {
 	local file_count=0
 	
 	if [[ -f "$target" ]]; then
+		stats_output=$(process_single_file "$target" stats "$(dirname "$target")")
+		[[ -z "$stats_output" ]] && return 0
 		((file_count++))
-		stats_output=$(process_single_file "$target" stats)
 		IFS=: read -r bytes status <<< "$stats_output"
 		if [[ "$status" == "covered" ]]; then
 			covered_bytes=$((covered_bytes + bytes))
@@ -699,16 +901,20 @@ stats_par2s() {
 			uncovered_bytes=$((uncovered_bytes + bytes))
 		fi
 	elif [[ -d "$target" ]]; then
-		while IFS= read -r file; do
+		while IFS= read -r -d '' file; do
+			if should_ignore_path "$file" "$target"; then
+				continue
+			fi
+			stats_output=$(process_single_file "$file" stats "$target")
+			[[ -z "$stats_output" ]] && continue
 			((file_count++))
-			stats_output=$(process_single_file "$file" stats)
 			IFS=: read -r bytes status <<< "$stats_output"
 			if [[ "$status" == "covered" ]]; then
 				covered_bytes=$((covered_bytes + bytes))
 			else
 				uncovered_bytes=$((uncovered_bytes + bytes))
 			fi
-		done < <(find "$target" -type f -not -name "*.par2")
+		done < <(find "$target" -type f -not -name "*.par2" -print0)
 	else
 		echo "Error: $target is not a file or directory" >&2
 		return 1
@@ -740,14 +946,8 @@ debug() {
 	debug_mode && echo "DEBUG: $*" >&2
 }
 
-# Test output function
-test_error() {
-	echo "TEST ERROR: $*" >&2
-	return 1
-}
-# Test debug output function
-test_debug() {
-	echo "TEST DEBUG: $*" >&2
+show_about() {
+	echo "$PROJECT_DESCRIPTION"
 }
 
 # Print usage information
@@ -761,6 +961,7 @@ Usage: $cmd_name <command> [<file_or_directory>]
 
 Commands:
   help     Display this help message
+  about    Show a one-line description of Bitrot Guard
   create   Create par2 files for all files in directory or a single file
   update   Update par2 files for modified files in directory or a single file
   verify   Verify all par2 files in directory or a single file
@@ -810,6 +1011,8 @@ The block size is always rounded up to the nearest multiple of 4 bytes
 
 There's also a fairly comprehensive test suite, which you can run with:
   > ${cmd_name} test
+or directly via:
+  > ./test/test.sh
 
 Environment Variables:
   NUM_PAR2_THREADS  Number of threads to use for par2 operations.
@@ -821,6 +1024,13 @@ Environment Variables:
   PROTECT_DOTFILES  Protect dotfiles (files starting with .).
 					Defaults to 1 (true) if not set (dotfiles will not get skipped).
 					Example: PROTECT_DOTFILES=0 ./${cmd_name} create /path/to/dir
+  BRG_IGNORE_PATTERNS  Colon-separated glob patterns to skip (works like PATH).
+					Defaults to ignoring .git/.jj directories (including nested ones).
+					Example: BRG_IGNORE_PATTERNS="*.bak:node_modules/**" ./${cmd_name} update /path
+
+Ignore patterns can also be listed one per line in
+  ${XDG_CONFIG_HOME:-\$HOME/.config}/bitrot_guard/ignore
+Lines beginning with # are treated as comments.
 
 Dependencies:
 par2, of course (the Nix package I used is par2cmdline-turbo).
@@ -831,683 +1041,6 @@ It is assumed that these tools are available in the PATH via gstat, gtouch
 and sed. (On Nix[OS]/nix-darwin, the coreutils-prefixed package provides this,
 in case you don't want to shadow the BSD versions, which I recommend.)
 EOF
-}
-
-test_suite() {
-	test_dir=$(mktemp -d)
-	test_fails=0
-	test_debug "Testing in directory: $test_dir"
-	test_debug "Testing with $NUM_PAR2_THREADS threads"
-	
-	# Test 1: Create par2 files for directory
-	test_debug "Testing directory creation..."
-	if ! create_par2s "$test_dir" >/dev/null; then
-		test_error "create_par2s failed on directory"
-		((test_fails++))
-	fi
-	
-	# Test 2: Verify par2 files for directory
-	test_debug "Testing directory verification..."
-	if ! verify_par2s "$test_dir" >/dev/null; then
-		test_error "verify_par2s failed on directory"
-		((test_fails++))
-	fi
-	
-	# Test 3: Update par2 files for directory
-	test_debug "Testing directory update..."
-	if ! update_par2s "$test_dir" >/dev/null; then
-		test_error "update_par2s failed on directory"
-		((test_fails++))
-	fi
-	
-	# Test 4: Repair par2 files for directory
-	test_debug "Testing directory repair..."
-	if ! repair_par2s "$test_dir" >/dev/null; then
-		test_error "repair_par2s failed despite par2's built-in redundancy"
-		((test_fails++))
-	fi
-	
-	# Test 5: Clear par2 files for directory
-	test_debug "Testing directory clear..."
-	if ! clear_par2s "$test_dir" >/dev/null; then
-		test_error "clear_par2s failed on directory"
-		((test_fails++))
-	fi
-	
-	# Test 6: Stats for directory
-	test_debug "Testing directory stats..."
-	local stats_output
-	stats_output=$(stats_par2s "$test_dir")
-	if ! echo "$stats_output" | grep -q "Coverage: 100.00%"; then
-		test_error "stats_par2s failed on directory"
-		((test_fails++))
-	fi
-	
-	# Test 7: Create par2 files for non-existent directory
-	test_debug "Testing non-existent directory creation..."
-	if create_par2s "/non/existent/directory" >/dev/null; then
-		test_error "create_par2s should fail on non-existent directory"
-		((test_fails++))
-	fi
-	
-	# Test 8: Single file operations
-	test_debug "Testing single file operations..."
-	
-	# Create a test file
-	echo "This is a test file for single file operations" > "$test_dir/single.txt"
-	
-	# Test create on single file
-	if ! create_par2s "$test_dir/single.txt" >/dev/null; then
-		test_error "create_par2s failed on single file"
-		((test_fails++))
-	fi
-	
-	# Verify par2 file was created
-	if [[ ! -f "$test_dir/.single.txt.par2" ]]; then
-		test_error "Par2 file not created for single file"
-		((test_fails++))
-	fi
-	
-	# Test verify on single file
-	if ! verify_par2s "$test_dir/single.txt" >/dev/null; then
-		test_error "verify_par2s failed on single file"
-		((test_fails++))
-	fi
-	
-	# Test repair on single file
-	test_debug "Starting repair test"
-	# First clear any existing par2 files
-	test_debug "Clearing existing par2 files"
-	if ! clear_par2s "$test_dir/single.txt" >/dev/null; then
-		test_error "clear_par2s failed before repair test"
-		((test_fails++))
-	fi
-	# Create par2 file for original content
-	test_debug "Creating par2 file for original content"
-	if ! create_par2s "$test_dir/single.txt" >/dev/null; then
-		test_error "create_par2s failed before repair test"
-		((test_fails++))
-	fi
-	test_debug "Checking if par2 file exists: $(ls -la "$test_dir/.single.txt.par2" 2>/dev/null || echo "not found")"
-	# Then corrupt the file
-	test_debug "Corrupting file"
-	sed -i 's/test/tXst/' "$test_dir/single.txt"
-	test_debug "Corrupted file content: $(cat "$test_dir/single.txt")"
-	test_debug "Attempting repair"
-	if ! repair_par2s "$test_dir/single.txt" >/dev/null; then
-		test_error "repair_par2s failed despite par2's built-in redundancy"
-		((test_fails++))
-	fi
-	test_debug "Checking repaired file content: $(cat "$test_dir/single.txt")"
-	# Verify file was repaired
-	if ! grep -q "This is a test file for single file operations" "$test_dir/single.txt"; then
-		test_error "repair_par2s did not restore original file content"
-		((test_fails++))
-	fi
-	if ! verify_par2s "$test_dir/single.txt" >/dev/null; then
-		test_error "Verification failed after repair"
-		((test_fails++))
-	else
-		test_debug "Repair of $test_dir/single.txt succeeded, demonstrating par2's resilience to corruption"
-	fi
-	
-	# Test update on single file
-	echo "Modified content" > "$test_dir/single.txt"
-	if ! update_par2s "$test_dir/single.txt" >/dev/null; then
-		test_error "update_par2s failed on single file"
-		((test_fails++))
-	fi
-	
-	# Test stats on single file
-	local single_stats
-	single_stats=$(stats_par2s "$test_dir/single.txt")
-	if ! echo "$single_stats" | grep -q "Coverage: 100.00%"; then
-		test_error "stats_par2s failed on single file"
-		((test_fails++))
-	fi
-	
-	# Test clear on single file
-	if ! clear_par2s "$test_dir/single.txt" >/dev/null; then
-		test_error "clear_par2s failed on single file"
-		((test_fails++))
-	fi
-	
-	# Verify par2 file was removed
-	if [[ -f "$test_dir/.single.txt.par2" ]]; then
-		test_error "Par2 file not removed for single file"
-		((test_fails++))
-	fi
-	
-	# Test with filename containing special characters
-	test_debug "Testing filename with special characters..."
-	echo "This is a test file with special characters" > "$test_dir/test*file?.txt"
-	
-	# Test create on file with special characters
-	if ! create_par2s "$test_dir/test*file?.txt" >/dev/null; then
-		test_error "create_par2s failed on file with special characters"
-		((test_fails++))
-	fi
-	
-	# Verify par2 file was created with sanitized name
-	if [[ ! -f "$test_dir/.test_file_.txt.par2" ]]; then
-		test_error "Par2 file not created for file with special characters"
-		((test_fails++))
-	fi
-	
-	# Test verify on file with special characters
-	if ! verify_par2s "$test_dir/test*file?.txt" >/dev/null; then
-		test_error "verify_par2s failed on file with special characters"
-		((test_fails++))
-	fi
-	
-	# Test repair on file with special characters
-	# First clear any existing par2 files
-	if ! clear_par2s "$test_dir/test*file?.txt" >/dev/null; then
-		test_error "clear_par2s failed before repair test"
-		((test_fails++))
-	fi
-	# Create par2 file for original content
-	if ! create_par2s "$test_dir/test*file?.txt" >/dev/null; then
-		test_error "create_par2s failed before repair test"
-		((test_fails++))
-	fi
-	# Then corrupt the file
-	$SED -i 's/characters/characXers/' "$test_dir/test*file?.txt"
-	if ! repair_par2s "$test_dir/test*file?.txt" >/dev/null; then
-		test_error "repair_par2s failed on file with special characters"
-		((test_fails++))
-	fi
-	# Verify file was repaired
-	if ! grep -q "This is a test file with special characters" "$test_dir/test*file?.txt"; then
-		test_error "repair_par2s did not restore original file content"
-		((test_fails++))
-	fi
-	
-	# Test clear on file with special characters
-	if ! clear_par2s "$test_dir/test*file?.txt" >/dev/null; then
-		test_error "clear_par2s failed on file with special characters"
-		((test_fails++))
-	fi
-	
-	# Verify par2 file was removed
-	if [[ -f "$test_dir/.test_file_.txt.par2" ]]; then
-		test_error "Par2 file not removed for file with special characters"
-		((test_fails++))
-	fi
-	
-	# Test high redundancy warning
-	debug "Testing high redundancy warning..."
-	local warning_output
-	warning_output=$(BRG_REDUNDANCY=100 "$0" create "$test_dir/single.txt" 2>&1)
-	if ! echo "$warning_output" | grep -q "Warning: BRG_REDUNDANCY is set to 100%"; then
-		test_error "High redundancy warning not shown"
-		((test_fails++))
-	fi
-	
-	# Test normal redundancy (no warning)
-	debug "Testing normal redundancy..."
-	warning_output=$(BRG_REDUNDANCY=5 "$0" create "$test_dir/single.txt" 2>&1)
-	if echo "$warning_output" | grep -q "Warning: BRG_REDUNDANCY"; then
-		test_error "Warning shown for normal redundancy"
-		((test_fails++))
-	fi
-	
-	# Test corrupted par2 data
-	debug "Testing corrupted par2 data..."
-	# Create a test file
-	echo "This is a test file for par2 corruption test" > "$test_dir/corrupt_test.txt"
-	# Create par2 file
-	if ! create_par2s "$test_dir/corrupt_test.txt" >/dev/null; then
-		test_error "create_par2s failed before par2 corruption test"
-		((test_fails++))
-	fi
-	# Corrupt the par2 file using dd to change a single byte in the middle
-	local par2_size
-	par2_size=$($STAT -c %s "$test_dir/.corrupt_test.txt.par2")
-	local corrupt_pos=$((par2_size / 2))
-	test_debug "Corrupting par2 file at position $corrupt_pos"
-	printf 'X' | dd of="$test_dir/.corrupt_test.txt.par2" bs=1 seek="$corrupt_pos" count=1 conv=notrunc
-	# Now corrupt the original file
-	$SED -i 's/test/tXst/' "$test_dir/corrupt_test.txt"
-	# Try to repair - this should succeed due to par2's built-in redundancy
-	if ! repair_par2s "$test_dir/corrupt_test.txt" >/dev/null; then
-		test_error "repair_par2s failed despite par2's built-in redundancy"
-		((test_fails++))
-	fi
-	# Verify file was repaired
-	if ! grep -q "This is a test file for par2 corruption test" "$test_dir/corrupt_test.txt"; then
-		test_error "repair_par2s did not restore original file content"
-		((test_fails++))
-	else
-		test_debug "Repair of $test_dir/corrupt_test.txt succeeded, demonstrating par2's resilience to corruption"
-	fi
-	
-	# Test corrupted par2 data with intact original file
-	test_debug "Testing corrupted par2 data with intact original file..."
-	# Create a fresh test file
-	echo "This is another test file for par2 corruption test" > "$test_dir/corrupt_test2.txt"
-	# Create par2 file
-	if ! create_par2s "$test_dir/corrupt_test2.txt" >/dev/null; then
-		test_error "create_par2s failed before second par2 corruption test"
-		((test_fails++))
-	fi
-	# Save original content for comparison
-	local original_content
-	original_content=$(cat "$test_dir/corrupt_test2.txt")
-	# Corrupt the par2 file
-	par2_size=$($STAT -c %s "$test_dir/.corrupt_test2.txt.par2")
-	corrupt_pos=$((par2_size / 2))
-	test_debug "Corrupting second par2 file at position $corrupt_pos"
-	printf 'X' | dd of="$test_dir/.corrupt_test2.txt.par2" bs=1 seek="$corrupt_pos" count=1 conv=notrunc
-	# Verify should succeed due to par2's built-in redundancy
-	if ! verify_par2s "$test_dir/corrupt_test2.txt" >/dev/null; then
-		test_error "verify_par2s failed despite par2's built-in redundancy"
-		((test_fails++))
-	fi
-	# Check that original file is unchanged
-	if [[ "$(cat "$test_dir/corrupt_test2.txt")" != "$original_content" ]]; then
-		test_error "Original file was modified during verify"
-		((test_fails++))
-	fi
-	test_debug "Verify succeeded, demonstrating par2's resilience to corruption"
-	
-	# Test update command with orphaned par2 files
-	test_debug "Testing update command with orphaned par2 files"
-	# Create test files in a subdirectory
-	local update_test_dir="$test_dir/update_test"
-	mkdir -p "$update_test_dir/subdir"
-	echo "test file 1" > "$update_test_dir/file1.txt"
-	echo "test file 2" > "$update_test_dir/file2.txt"
-	echo "test file 3" > "$update_test_dir/subdir/file3.txt"
-	
-	# Create initial par2 files
-	create_par2s "$update_test_dir"
-	
-	# Manually create volume-based par2 files to simulate legacy par2 files
-	cp "$update_test_dir/.file2.txt.par2" "$update_test_dir/.file2.txt.vol0+1.par2"
-	cp "$update_test_dir/.file2.txt.par2" "$update_test_dir/.file2.txt.vol0+2.par2"
-	cp "$update_test_dir/.file1.txt.par2" "$update_test_dir/.file1.txt.vol0+1.par2"
-	
-	# Remove one of the source files to create an orphaned par2 set
-	rm "$update_test_dir/file2.txt"
-	
-	# Run update
-	update_par2s "$update_test_dir"
-	
-	# Verify entire par2 set for file2.txt was removed
-	if [[ -f "$update_test_dir/.file2.txt.par2" ]] || \
-	   [[ -f "$update_test_dir/.file2.txt.vol0+1.par2" ]] || \
-	   [[ -f "$update_test_dir/.file2.txt.vol0+2.par2" ]]; then
-		test_error "Orphaned par2 set was not completely removed"
-		((test_fails++))
-	fi
-	
-	# Verify par2 set for file1.txt still exists completely
-	if [[ ! -f "$update_test_dir/.file1.txt.par2" ]] || \
-	   [[ ! -f "$update_test_dir/.file1.txt.vol0+1.par2" ]]; then
-		test_error "Valid par2 set was incorrectly removed"
-		((test_fails++))
-	fi
-	
-	# Verify regular par2 file for file3.txt still exists
-	if [[ ! -f "$update_test_dir/subdir/.file3.txt.par2" ]]; then
-		test_error "Valid par2 file was incorrectly removed"
-		((test_fails++))
-	fi
-	
-	# Test dotfile handling
-	if ! test_dotfile_handling; then
-		test_error "Dotfile handling test failed"
-		((test_fails++))
-	fi
-	
-	if ((test_fails > 0)); then
-		test_error "Tests failed: $test_fails"
-		return $test_fails
-	fi
-
-	echo "All tests passed"
-	return 0
-}
-
-test_corruption_patterns() {
-	local test_dir
-	test_dir=$(mktemp -d)
-	local test_fails=0
-	trap 'rm -rf "$test_dir"' EXIT
-
-	test_debug "Testing par2 repair capabilities with different corruption patterns..."
-	
-	# Generate 100KB random file
-	dd if=/dev/urandom of="$test_dir/test.bin" bs=1024 count=100
-	test_debug "Created test file: $test_dir/test.bin"
-	
-	# Create par2 with 5% redundancy using our interface
-	"$0" create "$test_dir/test.bin"
-	test_debug "Created par2 file with 5% redundancy"
-	test_debug "$(ls -l "$test_dir")"
-	
-	# Test 1: Corrupt first 4KB
-	cp "$test_dir/test.bin" "$test_dir/test1.bin"
-	dd if=/dev/zero of="$test_dir/test1.bin" bs=4096 count=1 conv=notrunc
-	test_debug "Testing repair of first 4KB corruption..."
-	if ! "$0" repair "$test_dir/test1.bin"; then
-		test_error "Failed to repair first 4KB corruption"
-		((test_fails++))
-	fi
-	test_debug "First 4KB corruption test passed"
-	
-	# Test 2: Corrupt last 4KB
-	cp "$test_dir/test.bin" "$test_dir/test2.bin"
-	dd if=/dev/zero of="$test_dir/test2.bin" bs=4096 seek=24 count=1 conv=notrunc
-	test_debug "Testing repair of last 4KB corruption..."
-	if ! "$0" repair "$test_dir/test2.bin"; then
-		test_error "Failed to repair last 4KB corruption"
-		((test_fails++))
-	fi
-	test_debug "Last 4KB corruption test passed"
-	
-	# Test 3: Corrupt middle 4KB
-	cp "$test_dir/test.bin" "$test_dir/test3.bin"
-	dd if=/dev/zero of="$test_dir/test3.bin" bs=4096 seek=12 count=1 conv=notrunc
-	test_debug "Testing repair of middle 4KB corruption..."
-	if ! "$0" repair "$test_dir/test3.bin"; then
-		test_error "Failed to repair middle 4KB corruption"
-		((test_fails++))
-	fi
-	test_debug "Middle 4KB corruption test passed"
-	
-	# Test 4: Corrupt 8 random 512-byte chunks
-	cp "$test_dir/test.bin" "$test_dir/test4.bin"
-	# Use a deterministic seed for reproducibility
-	RANDOM=42
-	test_debug "Testing repair of 8 random 512-byte corruptions..."
-	for i in {1..8}; do
-		offset=$((RANDOM % (100*1024/512)))  # Random position within file (in 512-byte blocks)
-		dd if=/dev/zero of="$test_dir/test4.bin" bs=512 seek=$offset count=1 conv=notrunc
-		test_debug "Corrupted 512 bytes at offset: $((offset * 512)) bytes"
-	done
-	if ! "$0" repair "$test_dir/test4.bin"; then
-		test_error "Failed to repair random 512-byte corruptions"
-		((test_fails++))
-	else
-		test_debug "Random corruption test passed"
-	fi
-	
-	if ((test_fails > 0)); then
-		test_error "Corruption pattern tests failed: $test_fails"
-		return $test_fails
-	fi
-	return 0
-}
-
-test_dotfile_handling() {
-	local test_dir
-	test_dir=$(mktemp -d)
-	local test_fails=0
-	test_debug "DEBUG: Testing dotfile handling in directory: $test_dir"
-	
-	# Create test files
-	echo "test content" > "$test_dir/regular.txt"
-	echo "dotfile content" > "$test_dir/.hidden"
-	echo "ds store content" > "$test_dir/.DS_Store"
-	
-	# Test with PROTECT_DOTFILES=0 (default)
-	PROTECT_DOTFILES=0 create_par2s "$test_dir"
-	
-	# Verify only regular file has par2
-	[[ -f "$test_dir/.regular.txt.par2" ]] || { test_error "Par2 not created for regular file" ; ((test_fails++)) }
-	[[ ! -f "$test_dir/..hidden.par2" ]] || { test_error "Par2 created for hidden file when PROTECT_DOTFILES=0" ; ((test_fails++)) }
-	[[ ! -f "$test_dir/..DS_Store.par2" ]] || { test_error "Par2 created for .DS_Store when PROTECT_DOTFILES=0" ; ((test_fails++)) }
-	
-	# Test with PROTECT_DOTFILES=1
-	PROTECT_DOTFILES=1 create_par2s "$test_dir"
-	
-	# Verify all files have par2s
-	[[ -f "$test_dir/.regular.txt.par2" ]] || { test_error "Par2 not created for regular file" ; ((test_fails++)) }
-	[[ -f "$test_dir/..hidden.par2" ]] || { test_error "Par2 not created for hidden file when PROTECT_DOTFILES=1" ; ((test_fails++)) }
-	[[ -f "$test_dir/..DS_Store.par2" ]] || { test_error "Par2 not created for .DS_Store when PROTECT_DOTFILES=1" ; ((test_fails++)) }
-	
-	# Test update with PROTECT_DOTFILES=0
-	rm "$test_dir/.hidden"
-	PROTECT_DOTFILES=0 update_par2s "$test_dir"
-	
-	# Verify dotfile par2s are ignored
-	[[ -f "$test_dir/..hidden.par2" ]] || { test_error "Orphaned hidden file par2 removed when PROTECT_DOTFILES=0" ; ((test_fails++)) }
-	
-	# Test update with PROTECT_DOTFILES=1
-	PROTECT_DOTFILES=1 update_par2s "$test_dir"
-	
-	# Verify orphaned dotfile par2s are removed
-	[[ ! -f "$test_dir/..hidden.par2" ]] || { test_error "Orphaned hidden file par2 not removed when PROTECT_DOTFILES=1" ; ((test_fails++)) }
-	[[ -f "$test_dir/..DS_Store.par2" ]] || { test_error "Existing dotfile par2 removed when PROTECT_DOTFILES=1" ; ((test_fails++)) }
-	
-	rm -rf "$test_dir"
-	
-	if ((test_fails > 0)); then
-		test_error "Dotfile handling tests failed: $test_fails"
-		return $test_fails
-	fi
-	return 0
-}
-
-test_resource_fork_handling() {
-	# Skip this test on non-macOS systems
-	if ! is_macos; then
-		test_debug "Skipping resource fork tests on non-macOS system"
-		return 0
-	fi
-
-	local test_dir
-	test_dir=$(mktemp -d)
-	local test_fails=0
-	test_debug "Testing in directory: $test_dir"
-
-	# Create a test file with resource fork
-	local test_file="$test_dir/test.txt"
-	local test_file_rsrc="$test_file/..namedfork/rsrc"
-	echo "Main content" > "$test_file"
-	echo "Resource fork content" > "$test_file_rsrc"
-
-	# Test has_resource_fork function
-	if ! has_resource_fork "$test_file"; then
-		test_error "has_resource_fork failed to detect resource fork"
-		((test_fails++))
-	fi
-
-	# Test create on file with resource fork
-	if ! create_par2s "$test_file" >/dev/null; then
-		test_error "create_par2s failed on file with resource fork"
-		((test_fails++))
-	fi
-
-	# Verify both par2 files were created (one for data fork, one for resource fork)
-	if [[ ! -f "$test_dir/.test.txt.par2" ]]; then
-		test_error "Par2 file not created for data fork"
-		((test_fails++))
-	fi
-	if [[ ! -f "$test_dir/.test.txt.rsrc.par2" ]]; then
-		test_error "Par2 file not created for resource fork"
-		((test_fails++))
-	fi
-
-	# Test verify on file with resource fork
-	if ! verify_par2s "$test_file" >/dev/null; then
-		test_error "verify_par2s failed on file with resource fork"
-		((test_fails++))
-	fi
-
-	# Test repair on file with resource fork
-	# First, record the original modification time
-	local tmpfile_mtime=$(mktemp)
-	$TOUCH -r "$test_file" "$tmpfile_mtime"
-
-	# local test_file_mtime=$($STAT -c%Y "$test_file") # GNU stat expected!
-	# local test_file_rsrc_mtime=$($STAT -c%Y "$test_file_rsrc") # GNU stat expected!
-	# Then corrupt both forks
-	echo "Xain content" > "$test_file"
-	echo "Xesource fork content" > "$test_file_rsrc"
-	# Then restore the original modification time using gtouch
-	# and the original file mod time stored on the temp file
-	$TOUCH -r "$tmpfile_mtime" "$test_file"
-	rm "$tmpfile_mtime"
-	
-	if ! repair_par2s "$test_file" >/dev/null; then
-		test_error "repair_par2s failed on file with resource fork"
-		((test_fails++))
-	fi
-
-	# Verify both forks were repaired
-	if ! grep -q "Main content" "$test_file"; then
-		test_error "repair_par2s did not restore data fork content"
-		((test_fails++))
-	fi
-	if ! grep -q "Resource fork content" "$test_file_rsrc"; then
-		test_error "repair_par2s did not restore resource fork content"
-		((test_fails++))
-	fi
-
-	# Test clear on file with resource fork
-	if ! clear_par2s "$test_file" >/dev/null; then
-		test_error "clear_par2s failed on file with resource fork"
-		((test_fails++))
-	fi
-
-	# Verify both par2 files were removed
-	if [[ -f "$test_dir/.test.txt.par2" ]]; then
-		test_error "Par2 file not removed for data fork"
-		((test_fails++))
-	fi
-	if [[ -f "$test_dir/.test.txt.rsrc.par2" ]]; then
-		test_error "Par2 file not removed for resource fork"
-		((test_fails++))
-	fi
-
-	rm -rf "$test_dir"
-	return "$test_fails"
-}
-
-test_timestamp_and_output() {
-	local test_dir
-	test_dir=$(mktemp -d)
-	trap 'rm -rf "$test_dir"' EXIT
-
-	# Create a test file with known timestamp
-	local test_file="$test_dir/test.txt"
-	# Create a 1MB file to ensure par2 creates vol files
-	dd if=/dev/urandom of="$test_file" bs=1M count=1 2>/dev/null
-	local test_time="202501010000.00"  # Jan 1, 2025 midnight
-	$TOUCH -t "$test_time" "$test_file"
-	local orig_time
-	orig_time=$($STAT -c%Y "$test_file")
-
-	# Override block size and redundancy for testing to force vol file creation
-	local old_redundancy=$BRG_REDUNDANCY
-	BRG_REDUNDANCY=20  # Higher redundancy = more vol files
-	
-	# Capture output while creating par2
-	local output
-	output=$(process_single_file "$test_file" create)
-	
-	# Restore original redundancy
-	BRG_REDUNDANCY=$old_redundancy
-	
-	# Test 1: Output format should include the filename
-	if [[ "$output" != *"$test_file"* ]]; then
-		test_error "Output '$output' does not contain filename '$test_file'"
-		return 1
-	fi
-
-	# Test 2: Par2 files should exist and have same timestamp as original
-	local par2_file
-	par2_file=$(get_par2_path "$test_file")
-	if [[ ! -f "$par2_file" ]]; then
-		test_error "Par2 file $par2_file not created"
-		return 1
-	fi
-	# Check main par2 file timestamp
-	local par2_time
-	par2_time=$($STAT -c%Y "$par2_file")
-	if [[ "$par2_time" != "$orig_time" ]]; then
-		test_error "Par2 file timestamp ($par2_time) does not match original ($orig_time)"
-		return 1
-	fi
-
-	# Check vol file timestamps
-	for volfile in "${par2_file%.*}".vol*.par2; do
-		if [[ ! -f "$volfile" ]]; then
-			test_error "Expected vol file $volfile not found"
-			return 1
-		fi
-		local vol_time
-		vol_time=$($STAT -c%Y "$volfile")
-		if [[ "$vol_time" != "$orig_time" ]]; then
-			test_error "Vol file $volfile timestamp ($vol_time) does not match original ($orig_time)"
-			return 1
-		fi
-	done
-
-	# Test 3: Parent directory timestamp should be preserved
-	local dir_time_before
-	dir_time_before=$($STAT -c%Y "$test_dir")
-	process_single_file "$test_file" create >/dev/null
-	local dir_time_after
-	dir_time_after=$($STAT -c%Y "$test_dir")
-	if [[ "$dir_time_before" != "$dir_time_after" ]]; then
-		test_error "Directory timestamp changed from $dir_time_before to $dir_time_after"
-		return 1
-	fi
-
-	test_debug "All timestamp and output tests passed"
-	return 0
-}
-
-test_all() {
-	local failed=0
-	
-	test_debug "Running all tests..."
-	
-	test_suite || ((failed++))
-	test_corruption_patterns || ((failed++))
-	test_dotfile_handling || ((failed++))
-	test_resource_fork_handling || ((failed++))
-	test_timestamp_and_output || ((failed++))
-	
-	if ((failed > 0)); then
-		test_error "$failed test suite(s) failed"
-		return 1
-	fi
-	return 0
-}
-
-test_all() {
-	local failed=0
-	
-	# Redirect all output to /dev/null unless DEBUG is set
-	if ! debug_mode; then
-		exec 3>&1 4>&2  # Save original stdout/stderr
-		# Pipe all output through grep to only show TEST ERROR/DEBUG lines
-		exec 1> >(grep "^TEST \(ERROR\|DEBUG\):" || true) 2>&1
-	fi
-	
-	test_debug "Running all tests..."
-	
-	test_suite || ((failed++))
-	test_corruption_patterns || ((failed++))
-	test_dotfile_handling || ((failed++))
-	test_resource_fork_handling || ((failed++))
-	test_timestamp_and_output || ((failed++))
-	
-	# Restore original stdout/stderr if we redirected them
-	if ! debug_mode; then
-		exec 1>&3 2>&4
-	fi
-	
-	if ((failed > 0)); then
-		test_error "$failed test suite(s) failed"
-		return 1
-	fi
-	return 0
 }
 
 # Main execution (if script is run directly)
@@ -1524,14 +1057,28 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
 	}
 	
 	ensure_target_arg_provided "$@"
+
+	# Allow subcommands to be prefixed with --
+	if [[ "$command" == --* && "$command" != "--" ]]; then
+		command="${command#--}"
+	fi
 	
 	case "$command" in
 		help|-h|--help)
 			show_help
 			exit 0
 			;;
+		about|-a|--about)
+			show_about
+			exit 0
+			;;
 		test)
-			test_all
+			test_script="$SCRIPT_DIR/test/test.sh"
+			if [[ ! -x "$test_script" ]]; then
+				echo "Error: Test suite not found at $test_script" >&2
+				exit 1
+			fi
+			"$test_script" "$0"
 			exit $?
 			;;
 		create|update|verify|repair|clear|stats)

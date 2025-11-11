@@ -57,7 +57,8 @@ Commands:
   update  - Update par2 files if target has changed
   clear   - Remove all par2 files
   stats   - Show protection coverage statistics
-  test    - Run the test suite
+  test    - Run the test suite (or run `./test/test.sh` directly)
+  about   - Show a one-line project description
 ```
 
 ## Environment Variables
@@ -65,6 +66,9 @@ Commands:
 - `NUM_PAR2_THREADS`: Number of threads for par2 (default: CPU core count)
 - `BRG_REDUNDANCY`: Percentage of redundancy (default: 5)
 - `PROTECT_DOTFILES`: Whether to protect hidden files (default: 1)
+- `BRG_IGNORE_PATTERNS`: Colon-separated glob patterns (like `PATH`) for files or directories to skip (default: ignores `.git/` and `.jj/` trees). Example: `BRG_IGNORE_PATTERNS="*.bak:node_modules/**"`.
+
+Ignore patterns can also be stored one per line (with `#` comments) in `"$XDG_CONFIG_HOME/bitrot_guard/ignore"` or `~/.config/bitrot_guard/ignore`.
 - `DEBUG`: Set to 1 to enable verbose debug output
 
 ## How It Works
