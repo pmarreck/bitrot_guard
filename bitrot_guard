@@ -4,7 +4,91 @@
 # set -euo pipefail
 
 IFS=$'\n\t'
-SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+
+resolve_script_dir() {
+	local source="${BASH_SOURCE[0]}"
+	if [[ ! "$source" =~ ^/ ]]; then
+		source="$PWD/$source"
+	fi
+	while [[ -L "$source" ]]; do
+		local dir
+		dir=$(cd -P "$(dirname "$source")" && pwd)
+		local target
+		target=$(readlink "$source") || return 1
+		if [[ "$target" == /* ]]; then
+			source="$target"
+		else
+			source="$dir/$target"
+		fi
+	done
+	cd -P "$(dirname "$source")" && pwd
+}
+
+SCRIPT_DIR=$(resolve_script_dir)
+TEST_SCRIPT="$SCRIPT_DIR/test/test.sh"
+
+falsey() {
+	local arg="${1:-}"
+	case "$arg" in
+		--help)
+			cat <<EOF
+Usage: truthy VARIABLE|value
+Returns success if the input is truthy, failure otherwise.
+
+Usage: falsey VARIABLE|value
+Returns success if the input is falsey (unset, empty, or values like 0/false/off/no/disable).
+EOF
+			return 0
+			;;
+		--test)
+			return 0
+			;;
+		"" )
+			return 0
+			;;
+	esac
+
+	local value
+	if [[ "$arg" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+		if [[ ${!arg+x} ]]; then
+			value="${!arg}"
+		else
+			return 0
+		fi
+	else
+		value="$arg"
+	fi
+
+	local lower
+	lower=$(printf '%s' "$value" | tr '[:upper:]' '[:lower:]')
+	case "$lower" in
+		""|0|f|false|off|n|no|disable|disabled)
+			return 0
+			;;
+		*)
+			return 1
+			;;
+	esac
+}
+
+truthy() {
+	local arg="${1:-}"
+	case "$arg" in
+		--help|--test)
+			falsey "$arg"
+			return 0
+			;;
+	esac
+	falsey "$arg"
+	local rc=$?
+	if [[ $rc -eq 0 ]]; then
+		return 1
+	elif [[ $rc -eq 1 ]]; then
+		return 0
+	else
+		return $rc
+	fi
+}
 
 # Get number of CPU cores based on OS
 get_cpu_cores() {
@@ -1045,7 +1129,7 @@ EOF
 
 # Main execution (if script is run directly)
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
-	command="$1"
+	raw_command="$1"
 	directory="$2"
 
 	ensure_target_arg_provided() {
@@ -1055,9 +1139,19 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
 			exit 1
 		fi
 	}
-	
+
 	ensure_target_arg_provided "$@"
 
+	if [[ "$raw_command" == "--test" ]]; then
+		if [[ ! -x "$TEST_SCRIPT" ]]; then
+			echo "Error: Test suite not found at $TEST_SCRIPT" >&2
+			exit 1
+		fi
+		QUIET=1 "$TEST_SCRIPT" "$0"
+		exit $?
+	fi
+
+	command="$raw_command"
 	# Allow subcommands to be prefixed with --
 	if [[ "$command" == --* && "$command" != "--" ]]; then
 		command="${command#--}"
@@ -1073,12 +1167,11 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
 			exit 0
 			;;
 		test)
-			test_script="$SCRIPT_DIR/test/test.sh"
-			if [[ ! -x "$test_script" ]]; then
-				echo "Error: Test suite not found at $test_script" >&2
+			if [[ ! -x "$TEST_SCRIPT" ]]; then
+				echo "Error: Test suite not found at $TEST_SCRIPT" >&2
 				exit 1
 			fi
-			"$test_script" "$0"
+			"$TEST_SCRIPT" "$0"
 			exit $?
 			;;
 		create|update|verify|repair|clear|stats)

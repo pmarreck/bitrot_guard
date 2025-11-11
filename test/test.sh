@@ -8,6 +8,74 @@ TARGET_BIN="$(cd "$(dirname "$TARGET_BIN")" && pwd)/$(basename "$TARGET_BIN")"
 TESTS=()
 TEMP_DIRS=()
 EXPECTED_ABOUT="Bitrot Guard creates and uses par2 redundancy to detect and repair bitrot in your files and directories."
+QUIET_MODE=0
+
+falsey() {
+	local arg="${1:-}"
+	case "$arg" in
+		--help)
+			cat <<EOF
+Usage: truthy VARIABLE|value
+Returns 0 (true) if the input is truthy, 1 otherwise.
+
+Usage: falsey VARIABLE|value
+Returns 0 if the input is falsey (unset, empty, or one of 0/false/off/n/no/disable/disabled).
+EOF
+			return 0
+			;;
+		--test)
+			return 0
+			;;
+		"" )
+			return 0
+			;;
+	esac
+
+	local value=""
+	if [[ "$arg" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+		if [[ ${!arg+x} ]]; then
+			value="${!arg}"
+		else
+			return 0
+		fi
+	else
+		value="$arg"
+	fi
+
+	local lower
+	lower=$(printf '%s' "$value" | tr '[:upper:]' '[:lower:]')
+	case "$lower" in
+		""|0|f|false|off|n|no|disable|disabled)
+			return 0
+			;;
+		*)
+			return 1
+			;;
+	esac
+}
+
+truthy() {
+	local arg="${1:-}"
+	case "$arg" in
+		--help|--test)
+			falsey "$arg"
+			return 0
+			;;
+	esac
+	falsey "$arg"
+	local rc=$?
+	if [[ $rc -eq 0 ]]; then
+		return 1
+	elif [[ $rc -eq 1 ]]; then
+		return 0
+	else
+		return $rc
+	fi
+}
+
+if truthy QUIET; then
+	QUIET_MODE=1
+fi
 
 cleanup() {
 	for dir in "${TEMP_DIRS[@]}"; do
@@ -17,12 +85,18 @@ cleanup() {
 trap cleanup EXIT
 
 log() {
-	echo "TEST DEBUG: $*" >&2
+	if truthy DEBUG; then
+		echo "TEST DEBUG: $*" >&2
+	fi
 }
 
 fail() {
 	echo "TEST ERROR: $*" >&2
 	return 1
+}
+
+run_quiet() {
+	"$TARGET_BIN" "$@" >/dev/null 2>&1
 }
 
 register_test() {
@@ -53,17 +127,17 @@ test_directory_lifecycle() {
 	echo "alpha" > "$file1"
 	echo "beta" > "$file2"
 
-	"$TARGET_BIN" create "$dir" >/dev/null
-	"$TARGET_BIN" verify "$dir" >/dev/null
+	run_quiet create "$dir"
+	run_quiet verify "$dir"
 	echo "gamma" >> "$file1"
-	"$TARGET_BIN" update "$dir" >/dev/null
-	"$TARGET_BIN" repair "$dir" >/dev/null
+	run_quiet update "$dir"
+	run_quiet repair "$dir"
 	stats=$("$TARGET_BIN" stats "$dir")
 	if [[ "$stats" != *"Coverage:"* ]]; then
 		fail "Stats missing coverage line"
 		return 1
 	fi
-	"$TARGET_BIN" clear "$dir" >/dev/null
+	run_quiet clear "$dir"
 	expect_par2_absent "$dir"
 }
 register_test test_directory_lifecycle
@@ -74,10 +148,10 @@ test_single_file_repair() {
 	dir=$(make_temp_dir)
 	file="$dir/single.txt"
 	echo "This is a test file for single file operations" > "$file"
-	"$TARGET_BIN" create "$file" >/dev/null
+	run_quiet create "$file"
 	printf 'X' | dd of="$file" bs=1 seek=5 conv=notrunc 2>/dev/null
-	"$TARGET_BIN" repair "$file" >/dev/null
-	"$TARGET_BIN" verify "$file" >/dev/null
+	run_quiet repair "$file"
+	run_quiet verify "$file"
 	if ! grep -q "This is a test file for single file operations" "$file"; then
 		fail "Repair did not restore file content"
 		return 1
@@ -91,13 +165,13 @@ test_cli_aliases() {
 	dir=$(make_temp_dir)
 	file="$dir/sample.txt"
 	echo "sample" > "$file"
-	"$TARGET_BIN" --create "$file" >/dev/null
+	"$TARGET_BIN" --create "$file" >/dev/null 2>&1
 	if [[ ! -f "$dir/.sample.txt.par2" ]]; then
 		fail "Alias --create did not create par2"
 		return 1
 	fi
-	"$TARGET_BIN" --verify "$file" >/dev/null
-	"$TARGET_BIN" --clear "$file" >/dev/null
+	"$TARGET_BIN" --verify "$file" >/dev/null 2>&1
+	"$TARGET_BIN" --clear "$file" >/dev/null 2>&1
 	expect_par2_absent "$dir"
 }
 register_test test_cli_aliases
@@ -108,12 +182,12 @@ test_protect_dotfiles() {
 	dir=$(make_temp_dir)
 	hidden="$dir/.hidden.txt"
 	echo "secret" > "$hidden"
-	PROTECT_DOTFILES=0 "$TARGET_BIN" create "$dir" >/dev/null
+	PROTECT_DOTFILES=0 run_quiet create "$dir"
 	if find "$dir" -name ".hidden.txt*.par2" -print -quit | grep -q .; then
 		fail "Dotfile was protected despite PROTECT_DOTFILES=0"
 		return 1
 	fi
-	PROTECT_DOTFILES=1 "$TARGET_BIN" update "$dir" >/dev/null
+	PROTECT_DOTFILES=1 run_quiet update "$dir"
 	if ! find "$dir" -name "*.par2" -print -quit | grep -q .; then
 		fail "Dotfile not protected when PROTECT_DOTFILES=1"
 		return 1
@@ -129,7 +203,7 @@ test_ignore_defaults() {
 	echo "ignored" > "$dir/.git/ignored.txt"
 	echo "ignored" > "$dir/.jj/ignored.txt"
 	echo "keep" > "$dir/keep.txt"
-	"$TARGET_BIN" create "$dir" >/dev/null
+	run_quiet create "$dir"
 	if find "$dir/.git" -name "*.par2" -print -quit | grep -q .; then
 		fail "Found par2 inside .git"
 		return 1
@@ -145,13 +219,28 @@ test_ignore_defaults() {
 }
 register_test test_ignore_defaults
 
+if ! truthy SKIP_SYMLINK_TEST; then
+	test_symlinked_test_invocation() {
+		log "test_symlinked_test_invocation"
+		local dir symlink
+		dir=$(make_temp_dir)
+		symlink="$dir/bitrot_guard"
+		ln -s "$TARGET_BIN" "$symlink"
+		if ! SKIP_SYMLINK_TEST=1 QUIET=1 "$symlink" --test >/dev/null 2>&1; then
+			fail "Symlinked --test invocation failed"
+			return 1
+		fi
+	}
+	register_test test_symlinked_test_invocation
+fi
+
 test_ignore_env() {
 	log "test_ignore_env"
 	local dir
 	dir=$(make_temp_dir)
 	echo "skip" > "$dir/env.skip"
 	echo "keep" > "$dir/env.keep"
-	BRG_IGNORE_PATTERNS="*.skip" "$TARGET_BIN" create "$dir" >/dev/null
+	BRG_IGNORE_PATTERNS="*.skip" run_quiet create "$dir"
 	if find "$dir" -name ".env.skip.par2" -print -quit | grep -q .; then
 		fail "Env pattern did not prevent protection"
 		return 1
@@ -172,7 +261,7 @@ test_ignore_config() {
 	echo "config.ignore" > "$config_home/bitrot_guard/ignore"
 	echo "skip me" > "$dir/config.ignore"
 	echo "keep me" > "$dir/process.cfg"
-	XDG_CONFIG_HOME="$config_home" "$TARGET_BIN" create "$dir" >/dev/null
+	XDG_CONFIG_HOME="$config_home" run_quiet create "$dir"
 	if find "$dir" -name ".config.ignore.par2" -print -quit | grep -q .; then
 		fail "Config ignore file still protected"
 		return 1
@@ -204,7 +293,7 @@ test_path_resolution_fallback() {
 	file="$real_dir/path-test.txt"
 	symlink="$link_base/link/path-test.txt"
 	echo "path data" > "$file"
-	"$TARGET_BIN" create "$symlink" >/dev/null
+	run_quiet create "$symlink"
 	printf 'Z' | dd of="$file" bs=1 seek=2 conv=notrunc 2>/dev/null
 	fake_path=$(make_temp_dir)
 	cat > "$fake_path/greadlink" <<'EOF'
@@ -233,7 +322,7 @@ test_newline_filename() {
 	dir=$(make_temp_dir)
 	file="$dir/newline"$'\n'"name.txt"
 	printf 'data' > "$file"
-	"$TARGET_BIN" create "$dir" >/dev/null
+	run_quiet create "$dir"
 	if ! find "$dir" -name ".*.par2" -print -quit | grep -q .; then
 		fail "No par2 created for newline filename"
 		return 1
@@ -247,11 +336,11 @@ test_corruption_repair() {
 	dir=$(make_temp_dir)
 	file="$dir/corrupt.bin"
 	dd if=/dev/urandom of="$file" bs=4096 count=64 >/dev/null 2>&1
-	"$TARGET_BIN" create "$file" >/dev/null
+	run_quiet create "$file"
 	dd if=/dev/zero of="$file" bs=512 count=1 seek=10 conv=notrunc >/dev/null 2>&1
 	dd if=/dev/zero of="$file" bs=512 count=1 seek=30 conv=notrunc >/dev/null 2>&1
-	"$TARGET_BIN" repair "$file" >/dev/null
-	"$TARGET_BIN" verify "$file" >/dev/null
+	run_quiet repair "$file"
+	run_quiet verify "$file"
 }
 register_test test_corruption_repair
 
@@ -264,10 +353,10 @@ test_resource_fork_handling() {
 	rsrc_path="$file/..namedfork/rsrc"
 	echo "Main content" > "$file"
 	echo "Resource fork content" > "$rsrc_path"
-	"$TARGET_BIN" create "$file" >/dev/null
+	run_quiet create "$file"
 	printf 'X' | dd of="$file" bs=1 count=1 conv=notrunc >/dev/null 2>&1
 	printf 'Y' | dd of="$rsrc_path" bs=1 count=1 conv=notrunc >/dev/null 2>&1
-	"$TARGET_BIN" repair "$file" >/dev/null
+	run_quiet repair "$file"
 	if ! grep -q "Main content" "$file"; then
 		fail "Main content not restored"
 		return 1
@@ -276,23 +365,31 @@ test_resource_fork_handling() {
 		fail "Resource fork not restored"
 		return 1
 	fi
-	"$TARGET_BIN" clear "$file" >/dev/null
+	run_quiet clear "$file"
 }
 [[ "$OSTYPE" == darwin* ]] && register_test test_resource_fork_handling
 
 run_tests() {
 	local failed=0
 	for test in "${TESTS[@]}"; do
-		if ! "$test"; then
-			log "$test failed"
+		if "$test"; then
+			if (( ! QUIET_MODE )); then
+				echo "TEST PASS: $test"
+			fi
+		else
+			echo "TEST FAIL: $test" >&2
 			((failed++))
 		fi
 	done
 	if ((failed > 0)); then
-		fail "$failed test suite(s) failed"
-		return 1
+		if (( ! QUIET_MODE )); then
+			echo "TEST SUMMARY: $failed failed" >&2
+		fi
+		return $failed
 	fi
-	log "All tests passed"
+	if (( ! QUIET_MODE )); then
+		echo "TEST SUMMARY: All tests passed"
+	fi
 	return 0
 }
 
