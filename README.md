@@ -66,7 +66,9 @@ Commands:
 - `NUM_PAR2_THREADS`: Number of threads for par2 (default: CPU core count)
 - `BRG_REDUNDANCY`: Percentage of redundancy (default: 5)
 - `PROTECT_DOTFILES`: Whether to protect hidden files (default: 1)
-- `BRG_IGNORE_PATTERNS`: Colon-separated glob patterns (like `PATH`) for files or directories to skip (default: ignores `.git/` and `.jj/` trees). Example: `BRG_IGNORE_PATTERNS="*.bak:node_modules/**"`.
+- `BRG_DEFAULT_IGNORE_PATTERNS`: Colon-separated glob patterns that replace the built-in defaults. If unset, defaults ignore common VCS/build/cache artifacts such as `.git/**`, `.jj/**`, `.elixir_ls/**`, `_build/**`, `node_modules/**`, `deps/**`, `target/**`, `dist/**`, `build/**`, virtualenvs (`.venv/**`, `venv/**`), Python caches (`__pycache__`, `.mypy_cache`, `.pytest_cache`), `.tox`, `.bundle`, `vendor/bundle`, `.cache`, `.parcel-cache`, `.angular/cache`, `.gradle`, `cmake-build-*`, `out`, `.idea`, `.vscode`, and `.DS_Store`.
+- `BRG_ADDITIONAL_IGNORE_PATTERNS`: Colon-separated globs appended after the defaults (or after `BRG_DEFAULT_IGNORE_PATTERNS` when it is set).
+- `BRG_IGNORE_PATTERNS`: Colon-separated globs appended last. Useful for per-invocation overrides. Example: `BRG_IGNORE_PATTERNS="*.bak:node_modules/**"`.
 
 Ignore patterns can also be stored one per line (with `#` comments) in `"$XDG_CONFIG_HOME/bitrot_guard/ignore"` or `~/.config/bitrot_guard/ignore`.
 - `DEBUG`: Set to 1 to enable verbose debug output

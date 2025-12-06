@@ -326,7 +326,34 @@ resolve_realpath() {
 BRG_REDUNDANCY=${BRG_REDUNDANCY:-5}
 PROTECT_DOTFILES=${PROTECT_DOTFILES:-1}
 PROJECT_DESCRIPTION="Bitrot Guard creates and uses par2 redundancy to detect and repair bitrot in your files and directories."
-declare -a DEFAULT_IGNORE_PATTERNS=(".git" ".git/**" "**/.git/**" ".jj" ".jj/**" "**/.jj/**")
+declare -a DEFAULT_IGNORE_PATTERNS=(
+	".git" ".git/**" "**/.git/**"
+	".jj" ".jj/**" "**/.jj/**"
+	".elixir_ls" ".elixir_ls/**" "**/.elixir_ls/**"
+	"_build" "_build/**" "**/_build/**"
+	"node_modules" "node_modules/**" "**/node_modules/**"
+	"deps" "deps/**" "**/deps/**"
+	"target" "target/**" "**/target/**"
+	"dist" "dist/**" "**/dist/**"
+	"build" "build/**" "**/build/**"
+	".venv" ".venv/**" "**/.venv/**"
+	"venv" "venv/**" "**/venv/**"
+	"__pycache__" "__pycache__/**" "**/__pycache__/**"
+	".mypy_cache" ".mypy_cache/**" "**/.mypy_cache/**"
+	".pytest_cache" ".pytest_cache/**" "**/.pytest_cache/**"
+	".tox" ".tox/**" "**/.tox/**"
+	".bundle" ".bundle/**" "**/.bundle/**"
+	"vendor/bundle" "vendor/bundle/**" "**/vendor/bundle/**"
+	".cache" ".cache/**" "**/.cache/**"
+	".parcel-cache" ".parcel-cache/**" "**/.parcel-cache/**"
+	".angular/cache" ".angular/cache/**" "**/.angular/cache/**"
+	".gradle" ".gradle/**" "**/.gradle/**"
+	"cmake-build-*" "cmake-build-*/**" "**/cmake-build-*" "**/cmake-build-*/**"
+	"out" "out/**" "**/out/**"
+	".idea" ".idea/**" "**/.idea/**"
+	".vscode" ".vscode/**" "**/.vscode/**"
+	".DS_Store"
+)
 BRG_IGNORE_PATTERNS_LOADED=0
 declare -a BRG_IGNORE_PATTERNS_CACHE=()
 
@@ -409,7 +436,22 @@ load_ignore_patterns() {
 		return
 	fi
 
-	local patterns=("${DEFAULT_IGNORE_PATTERNS[@]}")
+	local patterns
+	if [[ -n "${BRG_DEFAULT_IGNORE_PATTERNS:-}" ]]; then
+		IFS=':' read -r -a patterns <<< "$BRG_DEFAULT_IGNORE_PATTERNS"
+	else
+		patterns=("${DEFAULT_IGNORE_PATTERNS[@]}")
+	fi
+
+	if [[ -n "${BRG_ADDITIONAL_IGNORE_PATTERNS:-}" ]]; then
+		local extra
+		IFS=':' read -r -a extra <<< "$BRG_ADDITIONAL_IGNORE_PATTERNS"
+		for pattern in "${extra[@]}"; do
+			[[ -z "$pattern" ]] && continue
+			patterns+=("$pattern")
+		done
+	fi
+
 	if [[ -n "${BRG_IGNORE_PATTERNS:-}" ]]; then
 		IFS=':' read -r -a env_patterns <<< "$BRG_IGNORE_PATTERNS"
 		for pattern in "${env_patterns[@]}"; do

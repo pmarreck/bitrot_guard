@@ -217,19 +217,51 @@ register_test test_protect_dotfiles
 
 test_ignore_defaults() {
 	log "test_ignore_defaults"
-	local dir
+	local dir paths path
 	dir=$(make_temp_dir)
 	mkdir -p "$dir/.git" "$dir/.jj"
 	echo "ignored" > "$dir/.git/ignored.txt"
 	echo "ignored" > "$dir/.jj/ignored.txt"
 	echo "keep" > "$dir/keep.txt"
+	echo "desktop" > "$dir/.DS_Store"
+	paths=(
+		".elixir_ls/cache"
+		"_build/dev"
+		"node_modules/pkg"
+		"deps/lib"
+		"target/debug"
+		"dist/assets"
+		"build/output"
+		".venv/bin"
+		"venv/lib"
+		"__pycache__"
+		".mypy_cache"
+		".pytest_cache"
+		".tox"
+		".bundle"
+		"vendor/bundle"
+		".cache"
+		".parcel-cache"
+		".angular/cache"
+		".gradle"
+		"cmake-build-debug"
+		"out"
+		".idea"
+		".vscode"
+	)
+	for path in "${paths[@]}"; do
+		mkdir -p "$dir/$path"
+		echo "ignored" > "$dir/$path/ignore.me"
+	done
 	run_quiet create "$dir"
-	if find "$dir/.git" -name "*.par2" -print -quit | grep -q .; then
-		fail "Found par2 inside .git"
-		return 1
-	fi
-	if find "$dir/.jj" -name "*.par2" -print -quit | grep -q .; then
-		fail "Found par2 inside .jj"
+	for path in ".git" ".jj" "${paths[@]}"; do
+		if find "$dir/$path" -name "*.par2" -print -quit | grep -q .; then
+			fail "Found par2 inside $path"
+			return 1
+		fi
+		done
+	if find "$dir" -name ".DS_Store.par2" -print -quit | grep -q .; then
+		fail "Found par2 for .DS_Store"
 		return 1
 	fi
 	if ! find "$dir" -name ".keep.txt.par2" -print -quit | grep -q .; then
@@ -364,6 +396,49 @@ test_ignore_config() {
 	fi
 }
 register_test test_ignore_config
+
+test_override_default_ignore_env() {
+	log "test_override_default_ignore_env"
+	local dir
+	dir=$(make_temp_dir)
+	mkdir -p "$dir/node_modules/lib" "$dir/custom_only"
+	echo "mod" > "$dir/node_modules/lib/file.js"
+	echo "custom" > "$dir/custom_only/keep.txt"
+	BRG_DEFAULT_IGNORE_PATTERNS="custom_only:custom_only/**" run_quiet create "$dir"
+	if ! find "$dir/node_modules" -name "*.par2" -print -quit | grep -q .; then
+		fail "node_modules still ignored despite override"
+		return 1
+	fi
+	if find "$dir/custom_only" -name "*.par2" -print -quit | grep -q .; then
+		fail "Override pattern failed to ignore custom_only"
+		return 1
+	fi
+}
+register_test test_override_default_ignore_env
+
+test_additional_ignore_patterns_env() {
+	log "test_additional_ignore_patterns_env"
+	local dir
+	dir=$(make_temp_dir)
+	mkdir -p "$dir/extra_dir" "$dir/node_modules"
+	echo "extra" > "$dir/extra_dir/skip.txt"
+	echo "mod" > "$dir/node_modules/file.js"
+	echo "keep" > "$dir/keep.txt"
+	BRG_ADDITIONAL_IGNORE_PATTERNS="extra_dir/**" run_quiet create "$dir"
+	if find "$dir/extra_dir" -name "*.par2" -print -quit | grep -q .; then
+		fail "Additional ignore did not apply to extra_dir"
+		return 1
+	fi
+	if find "$dir/node_modules" -name "*.par2" -print -quit | grep -q .; then
+		fail "Default ignore missing for node_modules"
+		return 1
+	fi
+	if ! find "$dir" -name ".keep.txt.par2" -print -quit | grep -q .; then
+		fail "Non-ignored files missing par2"
+		return 1
+	fi
+}
+register_test test_additional_ignore_patterns_env
 
 test_about_output() {
 	log "test_about_output"
