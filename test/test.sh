@@ -110,6 +110,26 @@ make_temp_dir() {
 	printf '%s\n' "$dir"
 }
 
+abs_path() {
+	local target="$1" dir base
+	dir=$(cd "$(dirname "$target")" >/dev/null 2>&1 && pwd -P)
+	base=$(basename "$target")
+	printf '%s/%s\n' "$dir" "$base"
+}
+
+sanitize_filename() {
+	local name="$1"
+	printf '%s' "$name" | sed 's/[^A-Za-z0-9._-]/_/g'
+}
+
+get_par2_path() {
+	local orig_path="$1"
+	local base_dir=$(dirname "$orig_path")
+	local base_name=$(basename "$orig_path")
+	local sanitized_name=$(sanitize_filename "$base_name")
+	printf '%s/.%s.par2\n' "$base_dir" "$sanitized_name"
+}
+
 expect_par2_absent() {
 	local dir="$1"
 	if find "$dir" -name ".*.par2" -print -quit | grep -q .; then
@@ -233,6 +253,78 @@ if ! truthy SKIP_SYMLINK_TEST; then
 	}
 	register_test test_symlinked_test_invocation
 fi
+
+test_job_queue_plan_distribution() {
+	log "test_job_queue_plan_distribution"
+	local plan expected
+	plan=$(printf '700\talpha\n600\tbeta\n400\tgamma\n100\tdelta\n' | BRG_WORKERS=2 "$TARGET_BIN" queue-plan)
+	expected=$'worker1\t800\talpha delta\nworker2\t1000\tbeta gamma'
+	if [[ "$plan" != "$expected" ]]; then
+		fail "Job queue plan mismatch: $plan"
+		return 1
+	fi
+}
+register_test test_job_queue_plan_distribution
+
+test_queue_files_create_sorted() {
+	log "test_queue_files_create_sorted"
+	local dir f1 f2 f3 output expected
+	dir=$(make_temp_dir)
+	f1="$dir/big.bin"
+	f2="$dir/medium.bin"
+	f3="$dir/small.bin"
+	head -c 3072 </dev/zero > "$f1"
+	head -c 2048 </dev/zero > "$f2"
+	head -c 1024 </dev/zero > "$f3"
+	output=$("$TARGET_BIN" queue-files create "$dir")
+	expected=$(printf '3\t%s\n2\t%s\n1\t%s\n' "$(abs_path "$f1")" "$(abs_path "$f2")" "$(abs_path "$f3")")
+	if [[ "$output" != "$expected" ]]; then
+		fail "queue-files output mismatch: $output"
+		return 1
+	fi
+}
+register_test test_queue_files_create_sorted
+
+test_queue_files_update_filters_mtime() {
+	log "test_queue_files_update_filters_mtime"
+	local dir newer up_to_date missing par2_old par2_new output expected
+	dir=$(make_temp_dir)
+	newer="$dir/newer.bin"
+	up_to_date="$dir/up_to_date.bin"
+	missing="$dir/missing.bin"
+	head -c 2048 </dev/zero > "$newer"
+	head -c 1024 </dev/zero > "$up_to_date"
+	head -c 512 </dev/zero > "$missing"
+	par2_old=$(get_par2_path "$newer")
+	par2_new=$(get_par2_path "$up_to_date")
+	touch -t 202401010101 "$par2_old"
+	touch -t 202401010201 "$par2_new"
+	touch -t 202401010301 "$newer"
+	touch -t 202401010100 "$up_to_date"
+	output=$("$TARGET_BIN" queue-files update "$dir")
+	expected=$(printf '2\t%s\n1\t%s\n' "$(abs_path "$newer")" "$(abs_path "$missing")")
+	if [[ "$output" != "$expected" ]]; then
+		fail "queue-files update output mismatch: $output"
+		return 1
+	fi
+}
+register_test test_queue_files_update_filters_mtime
+
+test_performance_stub_exists() {
+	log "test_performance_stub_exists"
+	local script="$PROJECT_ROOT/test/perf.sh"
+	if [[ ! -x "$script" ]]; then
+		fail "performance script missing or not executable"
+		return 1
+	fi
+	local help
+	help=$("$script" --help)
+	if [[ "$help" != *"Bitrot Guard performance suite"* ]]; then
+		fail "performance script help missing expected text"
+		return 1
+	fi
+}
+register_test test_performance_stub_exists
 
 test_ignore_env() {
 	log "test_ignore_env"
