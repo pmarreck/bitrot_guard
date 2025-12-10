@@ -323,6 +323,7 @@ resolve_realpath() {
 
 # Set number of par2 threads, allowing override via environment variable
 : "${NUM_PAR2_THREADS:=$(get_cpu_cores)}"
+VERBOSE=${VERBOSE:-0}
 BRG_REDUNDANCY=${BRG_REDUNDANCY:-5}
 PROTECT_DOTFILES=${PROTECT_DOTFILES:-1}
 PROJECT_DESCRIPTION="Bitrot Guard creates and uses par2 redundancy to detect and repair bitrot in your files and directories."
@@ -569,18 +570,18 @@ get_resource_fork_par2_path() {
 }
 
 # Get path to the temporary location for a file's resource fork
-get_temp_resource_fork_path() {
+# Get the basename for the temporary resource fork
+get_resource_fork_temp_basename() {
 	local file="$1"
-	local base_dir=$(dirname "$file")
 	local base_name=$(basename "$file")
 	local sanitized_name=$(sanitize_filename "$base_name")
-	echo "${base_dir}/.${sanitized_name}.rsrc"
+	echo ".${sanitized_name}.rsrc"
 }
 
 get_abs_directory() {
 	local directory="$1"
 	local abs_directory
-	# Check if directory exists	
+	# Check if directory exists
 	# resolve it to an absolute path
 	if ! abs_directory=$(resolve_realpath "$directory"); then
 		echo "Error: Unable to resolve absolute path for '$directory'. Ensure greadlink (GNU coreutils) or perl is installed." >&2
@@ -612,7 +613,7 @@ remove_par2_files_for_file() {
 calculate_block_size() {
 	local file_size="$1"
 	local block_size
-	
+
 	# Calculate everything in one awk invocation:
 	# - Convert to KB
 	# - Calculate percentage using double exponential decay
@@ -623,26 +624,26 @@ calculate_block_size() {
 		BEGIN {
 			# Convert to KB
 			k = size / 1024
-			
+
 			# Calculate percentage using double exponential decay:
 			# 1.2: Base percentage (asymptotic minimum)
 			# 2.0 * exp(-0.001 * k): Slow decay term for gradual reduction from 1MB to 10MB
 			# 21 * exp(-0.3 * k): Fast decay term for steep initial drop from 1KB to 100KB
 			percent = 1.2 + 2.0 * exp(-0.001 * k) + 21 * exp(-0.3 * k)
-			
+
 			# Calculate block size in bytes
 			block_size = int((size * percent) / 100)
-			
+
 			# Ensure minimum block size of 4
 			if (block_size < 4) block_size = 4
-			
+
 			# Round up to nearest multiple of 4
 			block_size = int((block_size + 3) / 4) * 4
-			
+
 			print block_size
 		}
 	')
-	
+
 	echo "$block_size"
 }
 
@@ -652,7 +653,7 @@ should_process_file() {
 	local root="${2:-}"
 	local basename
 	basename=$(basename "$file")
-	
+
 	# Skip if file doesn't exist or is a par2 file
 	if [[ ! -f "$file" ]] || [[ "$basename" == *.par2 ]]; then
 		return 1
@@ -666,7 +667,7 @@ should_process_file() {
 	if should_ignore_path "$file" "$root"; then
 		return 1
 	fi
-	
+
 	return 0
 }
 
@@ -693,13 +694,25 @@ process_single_file() {
 		resource_fork_path=$(get_resource_fork_path "$file")
 		local resource_fork_par2_file
 		resource_fork_par2_file=$(get_resource_fork_par2_path "$file")
-		local temp_resource_fork_path
-		temp_resource_fork_path=$(get_temp_resource_fork_path "$file")
 		has_rf=true
+	fi
+
+	if $has_rf; then
+		case "$operation" in
+			create|verify|repair)
+				local temp_rf_dir
+				if ! temp_rf_dir=$(mktemp -d --tmpdir "brg_rsrc.XXXXXX"); then
+					echo "Error: Failed to create temporary directory for resource fork of $file" >&2
+					return 1
+				fi
+				local temp_resource_fork_path="$temp_rf_dir/$(get_resource_fork_temp_basename "$file")"
+				;;
+		esac
 	fi
 
 	case "$operation" in
 		create)
+			log_verbose "Creating protection for: $file"
 			if [[ -f "$par2_file" ]]; then
 				debug "Skipping $file: its par2 file already exists"
 				return 0
@@ -716,18 +729,18 @@ process_single_file() {
 
 			# Remove existing par2 files first
 			remove_par2_files_for_file "$file"
-			
+
 			if ! $PAR2 create -s"$block_size" -r"$BRG_REDUNDANCY" -n1 -T"$NUM_PAR2_THREADS" -a "$par2_file" "$file" >/dev/null; then
 				echo -e "\nError creating par2 for $file" >&2
 				return 1
 			fi
-			
+
 			# Verify the par2 files were actually created
 			if ! ls "${par2_file}"* >/dev/null 2>&1; then
 				echo -e "\nPar2 files were not created for $file" >&2
 				return 1
 			fi
-			
+
 			# Set the par2 files' timestamps to match the original file
 			local file_time
 			file_time=$($STAT -c%Y "$file") # NOTE: this is expected to be GNU stat!
@@ -736,12 +749,12 @@ process_single_file() {
 				debug "Setting timestamp on: $par2f"
 				$TOUCH -h --date="@$file_time" "$par2f"
 			done
-			
+
 			debug "Par2 file created: $(ls -la $par2_pattern)"
 			if $has_rf; then
 				debug "Creating par2 for resource fork: $resource_fork_path"
 				debug "Resource fork par2 file will be: $resource_fork_par2_file"
-				# Since par2 doesn't support resource forks, 
+				# Since par2 doesn't support resource forks,
 				# we need to create a temporary file to hold the resource fork
 				cat "$resource_fork_path" > "$temp_resource_fork_path"
 				debug "Created temporary file to hold resource fork: $temp_resource_fork_path"
@@ -749,13 +762,13 @@ process_single_file() {
 				rf_size=$($STAT -c%s "$resource_fork_path") # NOTE: this is expected to be GNU stat!
 				local rf_block_size
 				rf_block_size=$(calculate_block_size "$rf_size")
-				if ! $PAR2 create -s"$rf_block_size" -r"$BRG_REDUNDANCY" -n1 -T"$NUM_PAR2_THREADS" "$temp_resource_fork_path" >/dev/null; then
+				if ! $PAR2 create -s"$rf_block_size" -r"$BRG_REDUNDANCY" -n1 -T"$NUM_PAR2_THREADS" -B "$temp_rf_dir" -a "$resource_fork_par2_file" "$temp_resource_fork_path" >/dev/null; then
 					echo -e "\nError creating par2 for resource fork of $file of length $rf_size" >&2
-					rm "$temp_resource_fork_path"
+					rm -rf "$(dirname "$temp_resource_fork_path")"
 					return 1
 				fi
 
-				rm "$temp_resource_fork_path"
+				rm -rf "$(dirname "$temp_resource_fork_path")"
 				debug "Par2 file created: $resource_fork_par2_file"
 				# Set resource fork par2 files' timestamps to match the resource fork
 				local rsrc_time
@@ -770,6 +783,7 @@ process_single_file() {
 			;;
 
 		verify)
+			log_verbose "Verifying: $file"
 			[[ ! -f "$par2_file" ]] && return 0
 			debug "Verifying file: $file"
 			debug "Using par2 file: $par2_file"
@@ -784,27 +798,41 @@ process_single_file() {
 			fi
 
 			if $has_rf; then
-				# Since par2 doesn't support resource forks, 
+				# Since par2 doesn't support resource forks,
 				# we need to create a temporary file to hold the resource fork
 				cat "$resource_fork_path" > "$temp_resource_fork_path"
 				debug "Created temporary file to hold resource fork: $temp_resource_fork_path"
 				debug "Verifying resource fork"
-				if ! $PAR2 verify "${temp_resource_fork_path}.par2" >/dev/null; then
+				# We used -a when creating, so the par2 files are at $resource_fork_par2_file
+				# But par2 verify needs one of the par2 files as input.
+				# When we verified the main file, we passed the par2 file.
+				# Here we need to pass the resource fork par2 file.
+
+				# Check if the resource fork par2 file exists
+				if [[ ! -f "$resource_fork_par2_file" ]]; then
+					# Try to find it via glob if exact name not found (though get_resource_fork_par2_path returns the .par2 file usually)
+					# process_single_file create logic used "$resource_fork_par2_file" as the base name via -a.
+					# so it created [base].par2 or [base].vol*.par2
+					:
+				fi
+
+				if ! $PAR2 verify -B "$temp_rf_dir" "$resource_fork_par2_file" "$temp_resource_fork_path" >/dev/null; then
 					local rf_canonical
 					if ! rf_canonical=$(resolve_realpath "$file"); then
 						rf_canonical="$file"
 					fi
 					echo "Resource fork verification failed for $rf_canonical" >&2
-					rm "$temp_resource_fork_path"
+					rm -rf "$(dirname "$temp_resource_fork_path")"
 					return 1
 				fi
 				debug "Resource fork verification successful"
-				rm "$temp_resource_fork_path"
+				rm -rf "$(dirname "$temp_resource_fork_path")"
 			fi
-			$TOUCH -h --date="@$dir_time" "$file_dir"
+			# $TOUCH -h --date="@$dir_time" "$file_dir" # User requested to remove this for verify
 			;;
 
 		repair)
+			log_verbose "Repairing: $file"
 			[[ ! -f "$par2_file" ]] && return 0
 			debug "Repairing file: $file"
 			debug "Using par2 file: $par2_file"
@@ -816,7 +844,7 @@ process_single_file() {
 			debug "PAR2 command: $PAR2 repair -q \"$par2_file\" \"$file\""
 
 			if $has_rf; then
-				# Since par2 doesn't support resource forks, 
+				# Since par2 doesn't support resource forks,
 				# we need to create a temporary file to hold the resource fork
 				cat "$resource_fork_path" > "$temp_resource_fork_path"
 				debug "cat $resource_fork_path > $temp_resource_fork_path"
@@ -825,23 +853,23 @@ process_single_file() {
 			# PAR2's repair obliterates any resource forks. Hence the logic here.
 			if ! $PAR2 repair -q "$par2_file" "$file"; then
 				echo -e "\nError repairing $file" >&2
-				$has_rf && rm "$temp_resource_fork_path"
+				$has_rf && rm -rf "$(dirname "$temp_resource_fork_path")"
 				return 1
 			fi
 			debug "$(if $has_rf; then echo "Data fork of f"; else echo "F"; fi)ile repaired: $(ls -l "$file")"
 			if $has_rf; then
 				debug "Repairing resource fork"
 				debug "PAR2 command: $PAR2 repair -q \"$resource_fork_par2_file\" \"$temp_resource_fork_path\""
-				if ! $PAR2 repair -q "$resource_fork_par2_file" "$temp_resource_fork_path"; then
+				if ! $PAR2 repair -q -B "$temp_rf_dir" "$resource_fork_par2_file" "$temp_resource_fork_path"; then
 					debug "Resource fork repair failed for $file"
 					debug "Detailed error output: $($PAR2 repair "$resource_fork_par2_file" "$temp_resource_fork_path" 2>&1)"
-					rm "$temp_resource_fork_path"
+					rm -rf "$(dirname "$temp_resource_fork_path")"
 					return 1
 				fi
 				debug "Resource fork repaired in temporary location: $(ls -l "$temp_resource_fork_path")"
 				debug "Copying temporary resource fork back to: $resource_fork_path"
 				cat "$temp_resource_fork_path" > "$resource_fork_path"
-				rm "$temp_resource_fork_path"
+				rm -rf "$(dirname "$temp_resource_fork_path")"
 			fi
 
 			debug "Directory contents after repair: $(ls -la "$file_dir")"
@@ -851,11 +879,13 @@ process_single_file() {
 			;;
 
 		clear)
+			log_verbose "Clearing protection for: $file"
 			remove_par2_files_for_file "$file"
 			$TOUCH -h --date="@$dir_time" "$file_dir"
 			;;
 
 		update)
+			log_verbose "Checking for updates: $file"
 			if [[ ! -f "$par2_file" ]]; then
 				process_single_file "$file" create "$root"
 				return $?
@@ -925,18 +955,18 @@ create_par2s() {
 	local target="$1"
 
 	debug "Attempting create on target: $target"
-	
+
 	if [[ -f "$target" ]]; then
 		debug "Target is a file, calling process_single_file $target create"
 		process_single_file "$target" create "$(dirname "$target")"
 		return $?
 	fi
-	
+
 	if [[ ! -d "$target" ]]; then
 		echo "Error: $target is not a file or directory" >&2
 		return 1
 	fi
-	
+
 	while IFS= read -r -d '' file; do
 		if should_ignore_path "$file" "$target"; then
 			debug "Skipping ignored path during create: $file"
@@ -952,7 +982,7 @@ update_par2s() {
 	local target="$1"
 
 	debug "Attempting update on target: $target"
-	
+
 	if [[ -f "$target" ]]; then
 		local file_root
 		file_root=$(dirname "$target")
@@ -965,19 +995,19 @@ update_par2s() {
 			return 0
 		fi
 	fi
-	
+
 	if [[ ! -d "$target" ]]; then
 		echo "Error: $target is not a file or directory" >&2
 		return 1
 	fi
-	
+
 	echo "Scanning for par2 files in $target..."
-	
+
 	# Count total par2 files that are not resource fork par2 files for progress indication
 	local total_par2_files
 	total_par2_files=$(find "$target" -type f -not -name ".*.rsrc.par2" -name ".*.par2" -print0 | tr -cd '\0' | wc -c | $AWK '{print $1}')
 	echo "Found $total_par2_files par2 files to check"
-	
+
 	# First, remove orphaned par2 files and their associated volume files
 	local processed_files=0
 	local par2_dir par2_base orig_base
@@ -991,10 +1021,10 @@ update_par2s() {
 			debug "Skipping ignored par2 file: $par2_file"
 			continue
 		fi
-		
+
 		par2_dir=$(dirname "$par2_file")
 		par2_base=$(basename "$par2_file")
-		
+
 		# Extract the base name (without .par2 or .volX+Y)
 		if [[ "$par2_base" =~ \.vol ]]; then
 			orig_base="${par2_base%%.vol*}"
@@ -1002,19 +1032,19 @@ update_par2s() {
 			orig_base="${par2_base%.par2}"
 		fi
 		orig_base="${orig_base#.}"  # Remove leading dot
-		
+
 		# Skip if this is a dotfile and we're not protecting them
 		if [[ "$PROTECT_DOTFILES" != "1" && "$orig_base" == .* ]]; then
 			debug "Skipping dotfile: $orig_base (PROTECT_DOTFILES=$PROTECT_DOTFILES)"
 			continue
 		fi
-		
+
 		# Skip if this is a par2 file (regardless of extension)
 		if [[ "$orig_base" =~ \.(par2|vol[0-9]+\+[0-9]+\.par2)$ ]]; then
 			debug "Skipping par2 file: $orig_base"
 			continue
 		fi
-		
+
 		# Check if the original file exists
 		if [[ ! -f "$par2_dir/$orig_base" ]]; then
 			# Only process each set once (when we find the first file)
@@ -1024,10 +1054,10 @@ update_par2s() {
 			fi
 		fi
 	done < <(find "$target" -type f -not -name ".*.rsrc.par2" -name ".*.par2" -print0)
-	
+
 	echo "par2 file check complete"
 	echo "Scanning for files needing par2 updates..."
-	
+
 	# Count total files for progress indication, excluding dotfiles if not protected
 	local total_files
 	if [[ "$PROTECT_DOTFILES" == "1" ]]; then
@@ -1036,7 +1066,7 @@ update_par2s() {
 		total_files=$(find "$target" -type f -not -name ".*" -not -name "*.par2" -print0 | tr -cd '\0' | wc -c | $AWK '{print $1}')
 	fi
 	echo "Found $total_files files to process"
-	
+
 	# Then update/create par2 files as needed
 	processed_files=0
 	while IFS= read -r -d '' file; do
@@ -1050,7 +1080,7 @@ update_par2s() {
 		debug "Updating file: $file"
 		process_single_file "$file" update "$target"
 	done < <(find "$target" -type f -not -name "*.par2" -print0)
-	
+
 	echo "Update complete"
 }
 
@@ -1060,18 +1090,18 @@ verify_par2s() {
 	local exit_code=0
 
 	debug "Attempting verify on target: $target"
-	
+
 	if [[ -f "$target" ]]; then
 		debug "Target is a file, calling process_single_file $target verify"
 		process_single_file "$target" verify "$(dirname "$target")"
 		return $?
 	fi
-	
+
 	if [[ ! -d "$target" ]]; then
 		echo "Error: $target is not a file or directory" >&2
 		return 1
 	fi
-	
+
 	debug "Target is a directory, processing files recursively"
 	while IFS= read -r -d '' file; do
 		if should_ignore_path "$file" "$target"; then
@@ -1083,7 +1113,7 @@ verify_par2s() {
 			exit_code=1
 		fi
 	done < <(find "$target" -type f -not -name "*.par2" -print0)
-	
+
 	return $exit_code
 }
 
@@ -1091,20 +1121,20 @@ verify_par2s() {
 repair_par2s() {
 	local target="$1"
 	local exit_code=0
-	
+
 	debug "Attempting repair on target: $target"
-	
+
 	if [[ -f "$target" ]]; then
 		debug "Target is a file, calling process_single_file $target repair"
 		process_single_file "$target" repair "$(dirname "$target")"
 		return $?
 	fi
-	
+
 	if [[ ! -d "$target" ]]; then
 		echo "Error: $target is not a file or directory" >&2
 		return 1
 	fi
-	
+
 	debug "Target is a directory, processing files recursively"
 	while IFS= read -r -d '' file; do
 		if should_ignore_path "$file" "$target"; then
@@ -1116,7 +1146,7 @@ repair_par2s() {
 			exit_code=1
 		fi
 	done < <(find "$target" -type f -not -name "*.par2" -print0)
-	
+
 	return $exit_code
 }
 
@@ -1125,18 +1155,18 @@ clear_par2s() {
 	local target="$1"
 
 	debug "Attempting clear on target: $target"
-	
+
 	if [[ -f "$target" ]]; then
 		debug "Target is a file, calling process_single_file $target clear"
 		process_single_file "$target" clear "$(dirname "$target")"
 		return $?
 	fi
-	
+
 	if [[ ! -d "$target" ]]; then
 		echo "Error: $target is not a file or directory" >&2
 		return 1
 	fi
-	
+
 	debug "Target $target is a directory, processing files recursively"
 	while IFS= read -r -d '' par2_file; do
 		if should_ignore_path "$par2_file" "$target"; then
@@ -1156,7 +1186,7 @@ stats_par2s() {
 	local coverage_percent=0
 	local stats_output=""
 	local file_count=0
-	
+
 	if [[ -f "$target" ]]; then
 		stats_output=$(process_single_file "$target" stats "$(dirname "$target")")
 		[[ -z "$stats_output" ]] && return 0
@@ -1186,14 +1216,14 @@ stats_par2s() {
 		echo "Error: $target is not a file or directory" >&2
 		return 1
 	fi
-	
+
 	local total_bytes=$((covered_bytes + uncovered_bytes))
 	if [[ $total_bytes -gt 0 ]]; then
 		coverage_percent=$(echo "scale=2; ($covered_bytes * 100) / $total_bytes" | bc)
 	else
 		coverage_percent="100.00"
 	fi
-	
+
 	# Output statistics
 	echo "Statistics for $target:"
 	echo "Files processed: $file_count"
@@ -1211,6 +1241,13 @@ debug_mode() {
 # Debug output function
 debug() {
 	debug_mode && echo "DEBUG: $*" >&2
+}
+
+# Verbose output function
+log_verbose() {
+	if [[ "${VERBOSE:-0}" -eq 1 ]]; then
+		echo "$@" >&2
+	fi
 }
 
 show_about() {
@@ -1237,7 +1274,7 @@ Commands:
   stats    Show par2 coverage statistics for directory or a single file
   test     Run test suite
 
-par2 (which is doing most of the heavy lifting here) by default works at the 
+par2 (which is doing most of the heavy lifting here) by default works at the
 individual file level and allows you to specify a percentage of repairable
 redundancy (5% by default). This means that up to 5% of the file's content can
 be corrupted before the file is considered beyond repair. This extra information
@@ -1247,19 +1284,19 @@ was its original use-case), and not at the individual file or directory level.
 
 ${cmd_name} applies this at the directory level, across every file, recursively.
 
-For small files, it intelligently chooses the most efficient block size to 
+For small files, it intelligently chooses the most efficient block size to
 get as close to the covered percentage as possible in terms of extra space
 utilized. (There is some inevitable waste for really small files, though.)
 
 On macOS, it also does special handling around resource forks, which are not
 supported by par2 by default.
 
-The par2 files are created as hidden files (prefixed with '.', i.e., dotfiles) 
+The par2 files are created as hidden files (prefixed with '.', i.e., dotfiles)
 colocated in the same directory as the source files. (I decided this was a
 better strategy than putting them into a sqlite database or some other unified
 file or container.) Each set of one or more par2 files includes a default 5%
 redundancy. Block size is calculated as a percentage of the original file size
-using a double exponential decay formula (which was empirically determined 
+using a double exponential decay formula (which was empirically determined
 to be the most effective, separately):
   1.2: Base percentage (asymptotic minimum)
   2.0 * e^(-0.001 * k): Slow decay term for gradual reduction from 1MB to 10MB
@@ -1312,6 +1349,19 @@ EOF
 
 # Main execution (if script is run directly)
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+	# Parse recognized flags first
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+			-v|--verbose)
+				VERBOSE=1
+				shift
+				;;
+			*)
+				break
+				;;
+		esac
+	done
+
 	raw_command="$1"
 	directory="$2"
 
@@ -1339,7 +1389,15 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
 	if [[ "$command" == --* && "$command" != "--" ]]; then
 		command="${command#--}"
 	fi
-	
+
+	# Another pass to check for verbose flag if it was passed as part of subcommand arguments (e.g. subcommand -v)
+	# This is a bit hacky but allows `bitrot_guard verify -v path`
+	for arg in "$@"; do
+		if [[ "$arg" == "-v" || "$arg" == "--verbose" ]]; then
+			VERBOSE=1
+		fi
+	done
+
 	case "$command" in
 		help|-h|--help)
 			show_help

@@ -278,7 +278,7 @@ if ! truthy SKIP_SYMLINK_TEST; then
 		dir=$(make_temp_dir)
 		symlink="$dir/bitrot_guard"
 		ln -s "$TARGET_BIN" "$symlink"
-		if ! SKIP_SYMLINK_TEST=1 QUIET=1 "$symlink" --test >/dev/null 2>&1; then
+		if ! SKIP_SYMLINK_TEST=1 QUIET=1 "$symlink" --test; then
 			fail "Symlinked --test invocation failed"
 			return 1
 		fi
@@ -535,6 +535,25 @@ test_resource_fork_handling() {
 	run_quiet clear "$file"
 }
 [[ "$OSTYPE" == darwin* ]] && register_test test_resource_fork_handling
+
+test_verbose_output() {
+	log "test_verbose_output"
+	local dir file output
+	dir=$(make_temp_dir)
+	file="$dir/verbose.txt"
+	echo "content" > "$file"
+	output=$("$TARGET_BIN" -v create "$dir" 2>&1)
+	if [[ "$output" != *"Creating protection for: $file"* ]]; then
+		fail "Verbose output missing for create"
+		return 1
+	fi
+	output=$("$TARGET_BIN" --verbose verify "$dir" 2>&1)
+	if [[ "$output" != *"Verifying: $file"* ]]; then
+		fail "Verbose output missing for verify"
+		return 1
+	fi
+}
+register_test test_verbose_output
 
 run_tests() {
 	local failed=0
