@@ -9,6 +9,7 @@ TESTS=()
 TEMP_DIRS=()
 EXPECTED_ABOUT="Bitrot Guard creates and uses par2 redundancy to detect and repair bitrot in your files and directories."
 QUIET_MODE=0
+unset BRG_PAR2_STORE BRG_PAR2_DB_PATH
 
 falsey() {
 	local arg="${1:-}"
@@ -214,6 +215,532 @@ test_protect_dotfiles() {
 	fi
 }
 register_test test_protect_dotfiles
+
+test_sqlite_store_create_does_not_write_par2_files() {
+	log "test_sqlite_store_create_does_not_write_par2_files"
+	local dir file db stored_count
+	dir=$(make_temp_dir)
+	file="$dir/sqlite_store.txt"
+	db="$dir/brg_par2.sqlite3"
+
+	echo "hello sqlite store" > "$file"
+
+	BRG_PAR2_STORE=sqlite BRG_PAR2_DB_PATH="$db" run_quiet create "$file"
+
+	expect_par2_absent "$dir"
+	if [[ ! -f "$db" ]]; then
+		fail "Expected sqlite db to exist at $db"
+		return 1
+	fi
+
+	if ! command -v sqlite3 >/dev/null 2>&1; then
+		fail "sqlite3 is required for sqlite store tests"
+		return 1
+	fi
+
+	stored_count=$(sqlite3 "$db" "select count(*) from brg_par2_files;")
+	if [[ "$stored_count" -lt 1 ]]; then
+		fail "Expected at least one stored par2 row, got $stored_count"
+		return 1
+	fi
+}
+register_test test_sqlite_store_create_does_not_write_par2_files
+
+test_sqlite_store_excludes_db_file_from_protection() {
+	log "test_sqlite_store_excludes_db_file_from_protection"
+	local dir file db db_abs db_sql protected_count
+	dir=$(make_temp_dir)
+	file="$dir/keep.txt"
+	db="$dir/brg_par2.sqlite3"
+	db_abs=$(abs_path "$db")
+	db_sql=$(printf '%s' "$db_abs" | sed "s/'/''/g")
+
+	echo "protect me" > "$file"
+	: > "$db"
+
+	BRG_PAR2_STORE=sqlite BRG_PAR2_DB_PATH="$db" run_quiet create "$dir"
+
+	protected_count=$(sqlite3 "$db" "select count(*) from brg_par2_files where source_path = '$db_sql';")
+	if [[ "$protected_count" -ne 0 ]]; then
+		fail "Expected db file to be excluded from protection, but found $protected_count rows"
+		return 1
+	fi
+}
+register_test test_sqlite_store_excludes_db_file_from_protection
+
+test_sqlite_store_excludes_db_file_when_db_path_is_relative() {
+	log "test_sqlite_store_excludes_db_file_when_db_path_is_relative"
+	local dir file db db_abs db_sql protected_count db_marker
+	dir=$(make_temp_dir)
+	file="$dir/keep.txt"
+	db="$dir/brg_par2.sqlite3"
+	db_abs=$(abs_path "$db")
+	db_sql=$(printf '%s' "$db_abs" | sed "s/'/''/g")
+	db_marker="$dir/.brg_par2.sqlite3.brg_empty"
+
+	echo "protect me" > "$file"
+	: > "$db"
+
+	(
+		cd "$dir"
+		BRG_PAR2_STORE=sqlite BRG_PAR2_DB_PATH="brg_par2.sqlite3" "$TARGET_BIN" create "$dir" >/dev/null 2>&1
+	)
+
+	protected_count=$(sqlite3 "$db" "select count(*) from brg_par2_files where source_path = '$db_sql';")
+	if [[ "$protected_count" -ne 0 ]]; then
+		fail "Expected relative-path db file to be excluded from protection, but found $protected_count rows"
+		return 1
+	fi
+	if [[ -f "$db_marker" ]]; then
+		fail "Expected db file not to get a .brg_empty marker at $db_marker"
+		return 1
+	fi
+}
+register_test test_sqlite_store_excludes_db_file_when_db_path_is_relative
+
+test_sqlite_store_repair_restores_file() {
+	log "test_sqlite_store_repair_restores_file"
+	local dir file db original
+	dir=$(make_temp_dir)
+	file="$dir/sqlite_repair.txt"
+	db="$dir/brg_par2.sqlite3"
+	original="This is a sqlite-store repair test"
+
+	echo "$original" > "$file"
+
+	BRG_PAR2_STORE=sqlite BRG_PAR2_DB_PATH="$db" run_quiet create "$file"
+	printf 'X' | dd of="$file" bs=1 seek=5 conv=notrunc 2>/dev/null
+	BRG_PAR2_STORE=sqlite BRG_PAR2_DB_PATH="$db" run_quiet repair "$file"
+	BRG_PAR2_STORE=sqlite BRG_PAR2_DB_PATH="$db" run_quiet verify "$file"
+
+	if ! grep -q "$original" "$file"; then
+		fail "sqlite-store repair did not restore file content"
+		return 1
+	fi
+}
+register_test test_sqlite_store_repair_restores_file
+
+test_cli_par2_store_sqlite_flags() {
+	log "test_cli_par2_store_sqlite_flags"
+	local dir file db stored_count
+	dir=$(make_temp_dir)
+	file="$dir/cli_sqlite_flags.txt"
+	db="$dir/brg_par2.sqlite3"
+
+	echo "cli flags sqlite store" > "$file"
+
+	"$TARGET_BIN" --par2-store sqlite --par2-db "$db" create "$file" >/dev/null 2>&1
+
+	expect_par2_absent "$dir"
+	if [[ ! -f "$db" ]]; then
+		fail "Expected sqlite db to exist at $db"
+		return 1
+	fi
+
+	stored_count=$(sqlite3 "$db" "select count(*) from brg_par2_files;")
+	if [[ "$stored_count" -lt 1 ]]; then
+		fail "Expected at least one stored par2 row, got $stored_count"
+		return 1
+	fi
+}
+register_test test_cli_par2_store_sqlite_flags
+
+test_sqlite_store_clear_removes_entries() {
+	log "test_sqlite_store_clear_removes_entries"
+	local dir file db before after
+	dir=$(make_temp_dir)
+	file="$dir/clear_me.txt"
+	db="$dir/brg_par2.sqlite3"
+
+	echo "clear sqlite entries" > "$file"
+	BRG_PAR2_STORE=sqlite BRG_PAR2_DB_PATH="$db" run_quiet create "$file"
+	before=$(sqlite3 "$db" "select count(*) from brg_par2_files;")
+	if [[ "$before" -lt 1 ]]; then
+		fail "Expected at least one stored par2 row before clear, got $before"
+		return 1
+	fi
+
+	BRG_PAR2_STORE=sqlite BRG_PAR2_DB_PATH="$db" run_quiet clear "$file"
+	after=$(sqlite3 "$db" "select count(*) from brg_par2_files;")
+	if [[ "$after" -ne 0 ]]; then
+		fail "Expected 0 stored par2 rows after clear, got $after"
+		return 1
+	fi
+}
+register_test test_sqlite_store_clear_removes_entries
+
+test_sqlite_clear_directory_removes_rows_for_missing_files() {
+	log "test_sqlite_clear_directory_removes_rows_for_missing_files"
+	local dir file db file_abs file_sql before after
+	dir=$(make_temp_dir)
+	file="$dir/missing_after_clear.txt"
+	db="$dir/brg_par2.sqlite3"
+	file_abs=$(abs_path "$file")
+	file_sql=$(printf '%s' "$file_abs" | sed "s/'/''/g")
+
+	echo "will delete source" > "$file"
+	BRG_PAR2_STORE=sqlite BRG_PAR2_DB_PATH="$db" run_quiet create "$file"
+	rm -f "$file"
+
+	before=$(sqlite3 "$db" "select count(*) from brg_par2_files where source_path = '$file_sql';")
+	if [[ "$before" -lt 1 ]]; then
+		fail "Expected rows before clear, got $before"
+		return 1
+	fi
+
+	BRG_PAR2_STORE=sqlite BRG_PAR2_DB_PATH="$db" run_quiet clear "$dir"
+
+	after=$(sqlite3 "$db" "select count(*) from brg_par2_files where source_path = '$file_sql';")
+	if [[ "$after" -ne 0 ]]; then
+		fail "Expected rows to be removed by clear($dir), got $after"
+		return 1
+	fi
+}
+register_test test_sqlite_clear_directory_removes_rows_for_missing_files
+
+test_sqlite_clear_directory_removes_brg_empty_markers() {
+	log "test_sqlite_clear_directory_removes_brg_empty_markers"
+	local dir file db marker
+	dir=$(make_temp_dir)
+	file="$dir/empty_under_sqlite.txt"
+	db="$dir/brg_par2.sqlite3"
+	marker="$dir/.empty_under_sqlite.txt.brg_empty"
+
+	: > "$file"
+	BRG_PAR2_STORE=sqlite BRG_PAR2_DB_PATH="$db" run_quiet create "$dir"
+
+	if [[ ! -f "$marker" ]]; then
+		fail "Expected marker at $marker before clear"
+		return 1
+	fi
+
+	BRG_PAR2_STORE=sqlite BRG_PAR2_DB_PATH="$db" run_quiet clear "$dir"
+	if [[ -f "$marker" ]]; then
+		fail "Expected sqlite clear($dir) to remove marker at $marker"
+		return 1
+	fi
+}
+register_test test_sqlite_clear_directory_removes_brg_empty_markers
+
+test_sqlite_store_update_replaces_on_mtime_change() {
+	log "test_sqlite_store_update_replaces_on_mtime_change"
+	local dir file db file_abs file_sql mtime_old mtime_new stored_distinct stored_max
+	dir=$(make_temp_dir)
+	file="$dir/update_me.txt"
+	db="$dir/brg_par2.sqlite3"
+	file_abs=$(abs_path "$file")
+	file_sql=$(printf '%s' "$file_abs" | sed "s/'/''/g")
+	mtime_old=946684800
+	mtime_new=$((mtime_old + 60))
+
+	echo "first" > "$file"
+	gtouch -h --date="@$mtime_old" "$file" 2>/dev/null || touch -h --date="@$mtime_old" "$file"
+
+	BRG_PAR2_STORE=sqlite BRG_PAR2_DB_PATH="$db" run_quiet create "$file"
+
+	echo "second" >> "$file"
+	gtouch -h --date="@$mtime_new" "$file" 2>/dev/null || touch -h --date="@$mtime_new" "$file"
+
+	BRG_PAR2_STORE=sqlite BRG_PAR2_DB_PATH="$db" run_quiet update "$file"
+
+	stored_distinct=$(sqlite3 "$db" "select count(distinct source_mtime) from brg_par2_files where source_path = '$file_sql';")
+	if [[ "$stored_distinct" -ne 1 ]]; then
+		fail "Expected exactly 1 stored mtime after update, got $stored_distinct"
+		return 1
+	fi
+
+	stored_max=$(sqlite3 "$db" "select max(source_mtime) from brg_par2_files where source_path = '$file_sql';")
+	if [[ "$stored_max" -ne "$mtime_new" ]]; then
+		fail "Expected stored mtime $mtime_new after update, got $stored_max"
+		return 1
+	fi
+}
+register_test test_sqlite_store_update_replaces_on_mtime_change
+
+test_sqlite_store_stats_reports_covered() {
+	log "test_sqlite_store_stats_reports_covered"
+	local dir file db stats
+	dir=$(make_temp_dir)
+	file="$dir/stats.txt"
+	db="$dir/brg_par2.sqlite3"
+
+	echo "stats me" > "$file"
+	BRG_PAR2_STORE=sqlite BRG_PAR2_DB_PATH="$db" run_quiet create "$file"
+
+	stats=$(BRG_PAR2_STORE=sqlite BRG_PAR2_DB_PATH="$db" "$TARGET_BIN" stats "$file")
+	if [[ "$stats" != *"Coverage: 100.00%"* ]]; then
+		fail "Expected sqlite-store stats to report 100% coverage"
+		return 1
+	fi
+}
+register_test test_sqlite_store_stats_reports_covered
+
+test_sqlite_store_prune_removes_missing_sources() {
+	log "test_sqlite_store_prune_removes_missing_sources"
+	local dir file db before after
+	dir=$(make_temp_dir)
+	file="$dir/prune_me.txt"
+	db="$dir/brg_par2.sqlite3"
+
+	echo "prune sqlite rows" > "$file"
+	BRG_PAR2_STORE=sqlite BRG_PAR2_DB_PATH="$db" run_quiet create "$file"
+	rm -f "$file"
+
+	before=$(sqlite3 "$db" "select count(*) from brg_par2_files;")
+	if [[ "$before" -lt 1 ]]; then
+		fail "Expected rows in sqlite db before prune, got $before"
+		return 1
+	fi
+
+	BRG_PAR2_STORE=sqlite BRG_PAR2_DB_PATH="$db" run_quiet prune "$dir"
+
+	after=$(sqlite3 "$db" "select count(*) from brg_par2_files;")
+	if [[ "$after" -ne 0 ]]; then
+		fail "Expected 0 rows after prune, got $after"
+		return 1
+	fi
+}
+register_test test_sqlite_store_prune_removes_missing_sources
+
+test_sqlite_prune_is_scoped_to_target_path() {
+	log "test_sqlite_prune_is_scoped_to_target_path"
+	local dir_a dir_b file_a file_b db file_b_abs file_b_sql count_before count_after
+	dir_a=$(make_temp_dir)
+	dir_b=$(make_temp_dir)
+	db="$dir_a/brg_par2.sqlite3"
+	file_a="$dir_a/a.txt"
+	file_b="$dir_b/b.txt"
+	file_b_abs=$(abs_path "$file_b")
+	file_b_sql=$(printf '%s' "$file_b_abs" | sed "s/'/''/g")
+
+	echo "aaa" > "$file_a"
+	echo "bbb" > "$file_b"
+	BRG_PAR2_STORE=sqlite BRG_PAR2_DB_PATH="$db" run_quiet create "$file_a"
+	BRG_PAR2_STORE=sqlite BRG_PAR2_DB_PATH="$db" run_quiet create "$file_b"
+	rm -f "$file_b"
+
+	count_before=$(sqlite3 "$db" "select count(*) from brg_par2_files where source_path = '$file_b_sql';")
+	if [[ "$count_before" -lt 1 ]]; then
+		fail "Expected rows for file_b before prune, got $count_before"
+		return 1
+	fi
+
+	BRG_PAR2_STORE=sqlite BRG_PAR2_DB_PATH="$db" run_quiet prune "$dir_a"
+
+	count_after=$(sqlite3 "$db" "select count(*) from brg_par2_files where source_path = '$file_b_sql';")
+	if [[ "$count_after" -ne "$count_before" ]]; then
+		fail "Expected prune($dir_a) not to affect $file_b_abs rows"
+		return 1
+	fi
+
+	BRG_PAR2_STORE=sqlite BRG_PAR2_DB_PATH="$db" run_quiet prune "$dir_b"
+
+	count_after=$(sqlite3 "$db" "select count(*) from brg_par2_files where source_path = '$file_b_sql';")
+	if [[ "$count_after" -ne 0 ]]; then
+		fail "Expected prune($dir_b) to remove missing $file_b_abs rows"
+		return 1
+	fi
+}
+register_test test_sqlite_prune_is_scoped_to_target_path
+
+test_sqlite_store_does_not_require_xxd() {
+	log "test_sqlite_store_does_not_require_xxd"
+	local dir file db stub_dir stub_xxd real_xxd sentinel
+	dir=$(make_temp_dir)
+	file="$dir/no_xxd.txt"
+	db="$dir/brg_par2.sqlite3"
+
+	echo "no xxd please" > "$file"
+
+	stub_dir=$(mktemp -d --tmpdir brg_xxd_stub.XXXXXX)
+	TEMP_DIRS+=("$stub_dir")
+	stub_xxd="$stub_dir/xxd"
+	real_xxd=$(command -v xxd)
+	sentinel="$stub_dir/xxd_was_used"
+	cat >"$stub_xxd" <<EOF
+#!/usr/bin/env bash
+: >"$sentinel"
+"$real_xxd" "\$@"
+EOF
+	chmod +x "$stub_xxd"
+
+	PATH="$stub_dir:$PATH" BRG_PAR2_STORE=sqlite BRG_PAR2_DB_PATH="$db" run_quiet create "$file"
+	PATH="$stub_dir:$PATH" BRG_PAR2_STORE=sqlite BRG_PAR2_DB_PATH="$db" run_quiet verify "$file"
+	if [[ -f "$sentinel" ]]; then
+		fail "Expected sqlite store not to invoke xxd"
+		return 1
+	fi
+}
+register_test test_sqlite_store_does_not_require_xxd
+
+test_sqlite_store_errors_gracefully_without_readfile_writefile() {
+	log "test_sqlite_store_errors_gracefully_without_readfile_writefile"
+	local dir file db stub_dir stub_sqlite3 real_sqlite3 output rc
+	dir=$(make_temp_dir)
+	file="$dir/no_fileio_functions.txt"
+	db="$dir/brg_par2.sqlite3"
+	echo "hi" > "$file"
+
+	stub_dir=$(mktemp -d --tmpdir brg_sqlite3_stub.XXXXXX)
+	TEMP_DIRS+=("$stub_dir")
+	stub_sqlite3="$stub_dir/sqlite3"
+	real_sqlite3=$(command -v sqlite3)
+	cat >"$stub_sqlite3" <<EOF
+#!/usr/bin/env bash
+for arg in "\$@"; do
+	if [[ "\$arg" == *readfile* || "\$arg" == *writefile* ]]; then
+		echo "Error: no such function: readfile" >&2
+		exit 1
+	fi
+done
+exec "$real_sqlite3" "\$@"
+EOF
+	chmod +x "$stub_sqlite3"
+
+	set +e
+	output=$(PATH="$stub_dir:$PATH" BRG_PAR2_STORE=sqlite BRG_PAR2_DB_PATH="$db" "$TARGET_BIN" create "$file" 2>&1)
+	rc=$?
+	set -e
+	if [[ "$rc" -eq 0 ]]; then
+		fail "Expected create to fail when sqlite3 lacks readfile/writefile"
+		return 1
+	fi
+	if [[ "$output" != *requires*sqlite3* || "$output" != *readfile* || "$output" != *writefile* ]]; then
+		fail "Expected a graceful error mentioning sqlite3 readfile/writefile requirement"
+		return 1
+	fi
+}
+register_test test_sqlite_store_errors_gracefully_without_readfile_writefile
+
+test_filesystem_prune_removes_orphaned_par2_files() {
+	log "test_filesystem_prune_removes_orphaned_par2_files"
+	local dir file
+	dir=$(make_temp_dir)
+	file="$dir/orphan.txt"
+
+	echo "orphan par2 files" > "$file"
+	run_quiet create "$file"
+	rm -f "$file"
+
+	run_quiet prune "$dir"
+	expect_par2_absent "$dir"
+}
+register_test test_filesystem_prune_removes_orphaned_par2_files
+
+test_empty_file_create_writes_brg_empty_marker() {
+	log "test_empty_file_create_writes_brg_empty_marker"
+	local dir file marker
+	dir=$(make_temp_dir)
+	file="$dir/empty.txt"
+	: > "$file"
+
+	run_quiet create "$file"
+
+	marker="$dir/.empty.txt.brg_empty"
+	if [[ ! -f "$marker" ]]; then
+		fail "Expected empty-file marker at $marker"
+		return 1
+	fi
+	expect_par2_absent "$dir"
+}
+register_test test_empty_file_create_writes_brg_empty_marker
+
+test_empty_file_stats_reports_covered() {
+	log "test_empty_file_stats_reports_covered"
+	local dir file stats
+	dir=$(make_temp_dir)
+	file="$dir/empty_stats.txt"
+	: > "$file"
+
+	run_quiet create "$file"
+	stats=$("$TARGET_BIN" stats "$file")
+	if [[ "$stats" != *"Coverage: 100.00%"* ]]; then
+		fail "Expected empty-file stats to report 100% coverage"
+		return 1
+	fi
+}
+register_test test_empty_file_stats_reports_covered
+
+test_update_switches_to_empty_marker_even_if_mtime_not_newer() {
+	log "test_update_switches_to_empty_marker_even_if_mtime_not_newer"
+	local dir file marker old_mtime
+	dir=$(make_temp_dir)
+	file="$dir/update_empty.txt"
+	marker="$dir/.update_empty.txt.brg_empty"
+	old_mtime=946684800
+
+	echo "not empty" > "$file"
+	gtouch -h --date="@$old_mtime" "$file" 2>/dev/null || touch -h --date="@$old_mtime" "$file"
+	run_quiet create "$file"
+
+	: > "$file"
+	gtouch -h --date="@$old_mtime" "$file" 2>/dev/null || touch -h --date="@$old_mtime" "$file"
+	run_quiet update "$file"
+
+	if [[ ! -f "$marker" ]]; then
+		fail "Expected empty marker after update at $marker"
+		return 1
+	fi
+	expect_par2_absent "$dir"
+}
+register_test test_update_switches_to_empty_marker_even_if_mtime_not_newer
+
+test_directory_update_does_not_process_brg_empty_markers() {
+	log "test_directory_update_does_not_process_brg_empty_markers"
+	local dir file marker double_marker expected_markers actual_markers
+	dir=$(make_temp_dir)
+	file="$dir/dir_empty.txt"
+	: > "$file"
+
+	run_quiet create "$dir"
+
+	marker="$dir/.dir_empty.txt.brg_empty"
+	double_marker="$dir/..dir_empty.txt.brg_empty.brg_empty"
+	expected_markers=1
+	actual_markers=$(find "$dir" -maxdepth 1 -type f -name '*.brg_empty' | wc -l | tr -d ' ')
+	if [[ "$actual_markers" -ne "$expected_markers" ]]; then
+		fail "Expected $expected_markers brg_empty markers after create, got $actual_markers"
+		return 1
+	fi
+
+	run_quiet update "$dir"
+
+	actual_markers=$(find "$dir" -maxdepth 1 -type f -name '*.brg_empty' | wc -l | tr -d ' ')
+	if [[ "$actual_markers" -ne "$expected_markers" ]]; then
+		fail "Expected $expected_markers brg_empty markers after update, got $actual_markers"
+		return 1
+	fi
+	if [[ -f "$double_marker" ]]; then
+		fail "Did not expect marker-of-marker at $double_marker"
+		return 1
+	fi
+	expect_par2_absent "$dir"
+}
+register_test test_directory_update_does_not_process_brg_empty_markers
+
+test_filesystem_prune_removes_orphaned_brg_empty_markers() {
+	log "test_filesystem_prune_removes_orphaned_brg_empty_markers"
+	local dir file marker
+	dir=$(make_temp_dir)
+	file="$dir/orphan_empty.txt"
+	: > "$file"
+
+	run_quiet create "$file"
+	marker="$dir/.orphan_empty.txt.brg_empty"
+	if [[ ! -f "$marker" ]]; then
+		fail "Expected marker at $marker before prune"
+		return 1
+	fi
+
+	rm -f "$file"
+	run_quiet prune "$dir"
+
+	if [[ -f "$marker" ]]; then
+		fail "Expected orphan marker to be removed by prune"
+		return 1
+	fi
+}
+register_test test_filesystem_prune_removes_orphaned_brg_empty_markers
 
 test_ignore_defaults() {
 	log "test_ignore_defaults"

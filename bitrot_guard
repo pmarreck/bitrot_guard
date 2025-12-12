@@ -150,12 +150,12 @@ list_files_for_mode() {
 
 emit_sorted_file_list_from_find() {
 	local root="$1"
-	emit_sorted_file_list "$root" < <(find "$root" -type f -not -name '*.par2' -print0)
+	emit_sorted_file_list "$root" < <(find "$root" -type f -not -name '*.par2' -not -name '*.brg_empty' -print0)
 }
 
 emit_update_file_list_from_find() {
 	local root="$1"
-	emit_update_file_list "$root" < <(find "$root" -type f -not -name '*.par2' -print0)
+	emit_update_file_list "$root" < <(find "$root" -type f -not -name '*.par2' -not -name '*.brg_empty' -print0)
 }
 
 queue_files_command() {
@@ -326,6 +326,8 @@ resolve_realpath() {
 VERBOSE=${VERBOSE:-0}
 BRG_REDUNDANCY=${BRG_REDUNDANCY:-5}
 PROTECT_DOTFILES=${PROTECT_DOTFILES:-1}
+BRG_PAR2_STORE=${BRG_PAR2_STORE:-filesystem}
+BRG_PAR2_DB_PATH=${BRG_PAR2_DB_PATH:-}
 PROJECT_DESCRIPTION="Bitrot Guard creates and uses par2 redundancy to detect and repair bitrot in your files and directories."
 declare -a DEFAULT_IGNORE_PATTERNS=(
 	".git" ".git/**" "**/.git/**"
@@ -419,6 +421,464 @@ export STAT=${STAT:-$(command -v gstat || command -v stat)}
 export SED=${SED:-$(command -v gsed || command -v sed)}
 export PAR2=${PAR2:-$(command -v par2)}
 check_dependencies
+
+par2_store_is_sqlite() {
+	[[ "${BRG_PAR2_STORE:-filesystem}" == "sqlite" ]]
+}
+
+brg_default_par2_db_path() {
+	local data_home="${XDG_DATA_HOME:-$HOME/.local/share}"
+	printf '%s\n' "$data_home/bitrot_guard/par2.sqlite3"
+}
+
+brg_par2_db_path() {
+	if [[ -n "${BRG_PAR2_DB_PATH:-}" ]]; then
+		if [[ "$BRG_PAR2_DB_PATH" == /* ]]; then
+			printf '%s\n' "$BRG_PAR2_DB_PATH"
+		else
+			printf '%s\n' "$PWD/$BRG_PAR2_DB_PATH"
+		fi
+	else
+		brg_default_par2_db_path
+	fi
+}
+
+sqlite_escape() {
+	local value="$1"
+	printf '%s' "$value" | $SED "s/'/''/g"
+}
+
+sqlite_ensure_par2_schema() {
+	local db="$1"
+	sqlite3 "$db" <<'SQL'
+create table if not exists brg_par2_files (
+	source_path text not null,
+	source_uid integer not null,
+	source_gid integer not null,
+	source_mode integer not null,
+	source_mtime integer not null,
+	par2_name text not null,
+	par2_content blob not null,
+	primary key (source_path, source_uid, source_gid, source_mode, source_mtime, par2_name)
+);
+create index if not exists brg_par2_files_lookup on brg_par2_files (
+	source_path,
+	source_uid,
+	source_gid,
+	source_mode,
+	source_mtime
+);
+SQL
+}
+
+sqlite_require_fileio_functions() {
+	local db="$1"
+	if ! command -v sqlite3 >/dev/null 2>&1; then
+		echo "Error: sqlite3 is required when BRG_PAR2_STORE=sqlite" >&2
+		return 1
+	fi
+
+	local tmp_probe
+	if ! tmp_probe=$(mktemp --tmpdir "brg_sqlite_writefile_probe.XXXXXX"); then
+		echo "Error: Failed to create sqlite writefile probe temp file" >&2
+		return 1
+	fi
+	rm -f "$tmp_probe" 2>/dev/null || true
+
+	local db_sql tmp_sql
+	db_sql=$(sqlite_escape "$db")
+	tmp_sql=$(sqlite_escape "$tmp_probe")
+
+	if ! sqlite3 -batch :memory: "select length(readfile('$db_sql'));" >/dev/null 2>&1; then
+		echo "Error: bitrot_guard requires sqlite3 with readfile() and writefile() enabled for BRG_PAR2_STORE=sqlite." >&2
+		return 1
+	fi
+	if ! sqlite3 -batch :memory: "select writefile('$tmp_sql', X'');" >/dev/null 2>&1; then
+		echo "Error: bitrot_guard requires sqlite3 with readfile() and writefile() enabled for BRG_PAR2_STORE=sqlite." >&2
+		return 1
+	fi
+	rm -f "$tmp_probe" 2>/dev/null || true
+	return 0
+}
+
+sqlite_store_par2_file() {
+	local db="$1"
+	local source_path="$2"
+	local source_uid="$3"
+	local source_gid="$4"
+	local source_mode="$5"
+	local source_mtime="$6"
+	local par2_name="$7"
+	local par2_path="$8"
+
+	local source_path_sql par2_name_sql
+	source_path_sql=$(sqlite_escape "$source_path")
+	par2_name_sql=$(sqlite_escape "$par2_name")
+
+	local par2_path_sql
+	par2_path_sql=$(sqlite_escape "$par2_path")
+
+	sqlite3 "$db" "insert or replace into brg_par2_files (source_path, source_uid, source_gid, source_mode, source_mtime, par2_name, par2_content) values ('$source_path_sql', $source_uid, $source_gid, $source_mode, $source_mtime, '$par2_name_sql', readfile('$par2_path_sql'));"
+}
+
+sqlite_store_create_for_file() {
+	local file="$1"
+
+	if ! command -v sqlite3 >/dev/null 2>&1; then
+		echo "Error: sqlite3 is required when BRG_PAR2_STORE=sqlite" >&2
+		return 1
+	fi
+
+	local db
+	db=$(brg_par2_db_path)
+	local db_dir
+	db_dir=$(dirname "$db")
+	mkdir -p "$db_dir"
+
+	if ! sqlite_require_fileio_functions "$db"; then
+		return 1
+	fi
+
+	if ! sqlite_ensure_par2_schema "$db"; then
+		echo "Error: Failed to initialize sqlite par2 schema at $db" >&2
+		return 1
+	fi
+
+	local canonical
+	if ! canonical=$(resolve_realpath "$file"); then
+		canonical="$file"
+	fi
+
+	local source_uid source_gid source_mode source_mtime
+	source_uid=$($STAT -c%u "$file")
+	source_gid=$($STAT -c%g "$file")
+	source_mode=$($STAT -c%a "$file")
+	source_mtime=$($STAT -c%Y "$file")
+
+	local tmpdir
+	if ! tmpdir=$(mktemp -d --tmpdir "brg_par2.XXXXXX"); then
+		echo "Error: Failed to create temporary directory for sqlite par2 output" >&2
+		return 1
+	fi
+
+	local tmp_par2_base
+	tmp_par2_base="$tmpdir/$(basename "$(get_par2_path "$file")")"
+	local file_dir
+	file_dir=$(dirname "$file")
+
+	local file_size block_size
+	file_size=$($STAT -c%s "$file")
+	block_size=$(calculate_block_size "$file_size")
+
+	if ! $PAR2 create -B"$file_dir" -s"$block_size" -r"$BRG_REDUNDANCY" -n1 -T"$NUM_PAR2_THREADS" "$tmp_par2_base" "$file" >/dev/null; then
+		rm -rf "$tmpdir"
+		echo -e "\nError creating par2 for $file" >&2
+		return 1
+	fi
+
+	local par2f
+	for par2f in "${tmp_par2_base%.*}".vol*.par2 "${tmp_par2_base%.*}".par2; do
+		[[ -f "$par2f" ]] || continue
+		if ! sqlite_store_par2_file "$db" "$canonical" "$source_uid" "$source_gid" "$source_mode" "$source_mtime" "$(basename "$par2f")" "$par2f"; then
+			rm -rf "$tmpdir"
+			echo "Error: Failed storing par2 into sqlite for $file" >&2
+			return 1
+		fi
+	done
+
+	rm -rf "$tmpdir"
+}
+
+sqlite_materialize_latest_par2_set_for_file() {
+	local file="$1"
+	local tmpdir="$2"
+
+	local db
+	db=$(brg_par2_db_path)
+	[[ -f "$db" ]] || return 1
+
+	local canonical
+	if ! canonical=$(resolve_realpath "$file"); then
+		canonical="$file"
+	fi
+
+	local source_uid source_gid source_mode
+	source_uid=$($STAT -c%u "$file")
+	source_gid=$($STAT -c%g "$file")
+	source_mode=$($STAT -c%a "$file")
+
+	local canonical_sql
+	canonical_sql=$(sqlite_escape "$canonical")
+
+	local tmpdir_sql query
+	tmpdir_sql=$(sqlite_escape "$tmpdir")
+	query=$(
+		cat <<SQL
+select par2_name, writefile('$tmpdir_sql/' || par2_name, par2_content)
+from brg_par2_files
+where source_path = '$canonical_sql'
+	and source_uid = $source_uid
+	and source_gid = $source_gid
+	and source_mode = $source_mode
+	and source_mtime = (
+		select max(source_mtime)
+		from brg_par2_files
+		where source_path = '$canonical_sql'
+			and source_uid = $source_uid
+			and source_gid = $source_gid
+			and source_mode = $source_mode
+	);
+SQL
+	)
+
+	local main_par2=""
+	while IFS=$'\t' read -r par2_name bytes_written; do
+		[[ -z "$par2_name" ]] && continue
+		if [[ -z "$main_par2" && "$par2_name" == *.par2 && "$par2_name" != *.vol*.par2 ]]; then
+			main_par2="$tmpdir/$par2_name"
+		fi
+	done < <(sqlite3 -noheader -separator $'\t' "$db" "$query")
+
+	[[ -n "$main_par2" ]] || return 1
+	printf '%s\n' "$main_par2"
+}
+
+sqlite_store_clear_for_file() {
+	local file="$1"
+
+	if ! command -v sqlite3 >/dev/null 2>&1; then
+		return 0
+	fi
+
+	local db
+	db=$(brg_par2_db_path)
+	[[ -f "$db" ]] || return 0
+
+	local canonical
+	if ! canonical=$(resolve_realpath "$file"); then
+		canonical="$file"
+	fi
+
+	local canonical_sql
+	canonical_sql=$(sqlite_escape "$canonical")
+
+	sqlite3 "$db" "delete from brg_par2_files where source_path = '$canonical_sql';"
+}
+
+sqlite_store_latest_mtime_for_file() {
+	local file="$1"
+
+	local db
+	db=$(brg_par2_db_path)
+	[[ -f "$db" ]] || return 1
+
+	local canonical
+	if ! canonical=$(resolve_realpath "$file"); then
+		canonical="$file"
+	fi
+
+	local source_uid source_gid source_mode
+	source_uid=$($STAT -c%u "$file")
+	source_gid=$($STAT -c%g "$file")
+	source_mode=$($STAT -c%a "$file")
+
+	local canonical_sql
+	canonical_sql=$(sqlite_escape "$canonical")
+
+	sqlite3 "$db" "select max(source_mtime) from brg_par2_files where source_path = '$canonical_sql' and source_uid = $source_uid and source_gid = $source_gid and source_mode = $source_mode;"
+}
+
+sqlite_prune_missing_sources() {
+	local target="$1"
+
+	if ! command -v sqlite3 >/dev/null 2>&1; then
+		echo "Error: sqlite3 is required when BRG_PAR2_STORE=sqlite" >&2
+		return 1
+	fi
+
+	local db
+	db=$(brg_par2_db_path)
+	[[ -f "$db" ]] || return 0
+
+	local target_canon
+	if ! target_canon=$(resolve_realpath "$target" 2>/dev/null); then
+		target_canon="$target"
+	fi
+	target_canon="${target_canon%/}"
+
+	local target_sql
+	target_sql=$(sqlite_escape "$target_canon")
+
+	local query
+	if [[ -d "$target_canon" ]]; then
+		local like_prefix
+		like_prefix=$(printf '%s' "$target_canon" | $SED 's/[\\%_]/\\&/g')
+		like_prefix="${like_prefix%/}"
+		local like_sql
+		like_sql=$(sqlite_escape "$like_prefix")
+		query="select distinct source_path from brg_par2_files where source_path like '$like_sql/%' escape '\\';"
+	else
+		query="select distinct source_path from brg_par2_files where source_path = '$target_sql';"
+	fi
+
+	local source_path
+	while IFS= read -r source_path; do
+		[[ -z "$source_path" ]] && continue
+		if [[ ! -f "$source_path" ]]; then
+			local source_path_sql
+			source_path_sql=$(sqlite_escape "$source_path")
+			sqlite3 "$db" "delete from brg_par2_files where source_path = '$source_path_sql';" >/dev/null
+		fi
+	done < <(sqlite3 -noheader "$db" "$query")
+
+	return 0
+}
+
+sqlite_clear_scope() {
+	local target="$1"
+
+	local db
+	db=$(brg_par2_db_path)
+	[[ -f "$db" ]] || return 0
+
+	local target_canon
+	if ! target_canon=$(resolve_realpath "$target" 2>/dev/null); then
+		target_canon="$target"
+	fi
+	target_canon="${target_canon%/}"
+
+	local target_sql
+	target_sql=$(sqlite_escape "$target_canon")
+
+	local query
+	if [[ -d "$target_canon" ]]; then
+		local like_prefix
+		like_prefix=$(printf '%s' "$target_canon" | $SED 's/[\\%_]/\\&/g')
+		like_prefix="${like_prefix%/}"
+		local like_sql
+		like_sql=$(sqlite_escape "$like_prefix")
+		query="delete from brg_par2_files where source_path like '$like_sql/%' escape '\\';"
+	else
+		query="delete from brg_par2_files where source_path = '$target_sql';"
+	fi
+
+	sqlite3 "$db" "$query" >/dev/null
+}
+
+brg_store_prune_scope() {
+	local target="$1"
+	if par2_store_is_sqlite; then
+		sqlite_prune_missing_sources "$target"
+	else
+		filesystem_prune_orphaned_par2s "$target"
+	fi
+}
+
+brg_store_clear_scope() {
+	local target="$1"
+	if par2_store_is_sqlite; then
+		sqlite_clear_scope "$target"
+		if [[ -d "$target" ]]; then
+			while IFS= read -r -d '' marker; do
+				if should_ignore_path "$marker" "$target"; then
+					continue
+				fi
+				rm -f "$marker" 2>/dev/null || true
+			done < <(find "$target" -type f -name "*.brg_empty" -print0)
+		fi
+	else
+		clear_par2s "$target"
+	fi
+}
+
+filesystem_prune_orphaned_par2s() {
+	local target="$1"
+	local root="$target"
+	if [[ -f "$root" ]]; then
+		root=$(dirname "$root")
+	fi
+	local normalized_root
+	if ! normalized_root=$(resolve_realpath "$root" 2>/dev/null); then
+		normalized_root="$root"
+	fi
+
+	local -A keep_prefixes=()
+	while IFS= read -r -d '' file; do
+		if should_ignore_path "$file" "$normalized_root"; then
+			continue
+		fi
+		local base_name
+		base_name=$(basename "$file")
+		if [[ "$base_name" == *.par2 ]]; then
+			continue
+		fi
+		if [[ "$base_name" == *.brg_empty ]]; then
+			continue
+		fi
+		local par2_path prefix
+		par2_path=$(get_par2_path "$file")
+		prefix="${par2_path%.par2}"
+		keep_prefixes["$prefix"]=1
+		if has_resource_fork "$file"; then
+			local rf_par2 rf_prefix
+			rf_par2=$(get_resource_fork_par2_path "$file")
+			rf_prefix="${rf_par2%.par2}"
+			keep_prefixes["$rf_prefix"]=1
+		fi
+	done < <(find "$normalized_root" -type f -not -name '*.par2' -print0)
+
+	while IFS= read -r -d '' marker; do
+		if should_ignore_path "$marker" "$normalized_root"; then
+			continue
+		fi
+		local marker_dir
+		marker_dir=$(dirname "$marker")
+		local found=0
+		local candidate
+		while IFS= read -r -d '' candidate; do
+			if should_ignore_path "$candidate" "$normalized_root"; then
+				continue
+			fi
+			local candidate_base
+			candidate_base=$(basename "$candidate")
+			if [[ "$candidate_base" == *.par2 || "$candidate_base" == *.brg_empty ]]; then
+				continue
+			fi
+			if [[ "$(get_empty_marker_path "$candidate")" == "$marker" ]]; then
+				found=1
+				break
+			fi
+		done < <(find "$marker_dir" -maxdepth 1 -type f -print0)
+
+		if [[ "$found" -eq 0 ]]; then
+			rm -f "$marker" 2>/dev/null || true
+		fi
+	done < <(find "$normalized_root" -type f -name '*.brg_empty' -print0)
+
+	local -A pruned_prefixes=()
+	while IFS= read -r -d '' par2_file; do
+		if should_ignore_path "$par2_file" "$normalized_root"; then
+			continue
+		fi
+		local set_base set_prefix
+		set_base="${par2_file%.par2}"
+		set_prefix="${set_base%%.vol*}"
+		if [[ -n "${keep_prefixes[$set_prefix]+x}" ]]; then
+			continue
+		fi
+		if [[ -n "${pruned_prefixes[$set_prefix]+x}" ]]; then
+			continue
+		fi
+		pruned_prefixes["$set_prefix"]=1
+		local files=()
+		shopt -s nullglob
+		files=("${set_prefix}"*.par2)
+		shopt -u nullglob
+		if ((${#files[@]} > 0)); then
+			rm -f "${files[@]}" 2>/dev/null || true
+		fi
+	done < <(find "$normalized_root" -type f -name '*.par2' -print0)
+}
 
 # Utility function to sanitize filenames for par2
 sanitize_filename() {
@@ -551,6 +1011,14 @@ get_par2_path() {
 	echo "$par2_path"
 }
 
+get_empty_marker_path() {
+	local orig_path="$1"
+	local base_dir=$(dirname "$orig_path")
+	local base_name=$(basename "$orig_path")
+	local sanitized_name=$(sanitize_filename "$base_name")
+	printf '%s/.%s.brg_empty\n' "$base_dir" "$sanitized_name"
+}
+
 # Get the path to a file's resource fork
 get_resource_fork_path() {
 	if is_macos && [[ -f "${1}/..namedfork/rsrc" ]]; then
@@ -651,11 +1119,20 @@ calculate_block_size() {
 should_process_file() {
 	local file="$1"
 	local root="${2:-}"
+
+	if par2_store_is_sqlite; then
+		local db
+		db=$(brg_par2_db_path)
+		if [[ -n "$db" && "$file" == "$db" ]]; then
+			return 1
+		fi
+	fi
+
 	local basename
 	basename=$(basename "$file")
 
 	# Skip if file doesn't exist or is a par2 file
-	if [[ ! -f "$file" ]] || [[ "$basename" == *.par2 ]]; then
+	if [[ ! -f "$file" ]] || [[ "$basename" == *.par2 || "$basename" == *.brg_empty ]]; then
 		return 1
 	fi
 
@@ -713,6 +1190,29 @@ process_single_file() {
 	case "$operation" in
 		create)
 			log_verbose "Creating protection for: $file"
+			local file_size file_time
+			file_size=$($STAT -c%s "$file") # NOTE: this is expected to be GNU stat!
+			file_time=$($STAT -c%Y "$file") # NOTE: this is expected to be GNU stat!
+
+			if [[ "$file_size" -eq 0 ]]; then
+				local marker
+				marker=$(get_empty_marker_path "$file")
+				: > "$marker"
+				$TOUCH -h --date="@$file_time" "$marker"
+				echo "$file - Done."
+				$TOUCH -h --date="@$dir_time" "$file_dir"
+				return 0
+			fi
+
+			if par2_store_is_sqlite; then
+				if ! sqlite_store_create_for_file "$file"; then
+					return 1
+				fi
+				echo "$file - Done."
+				$TOUCH -h --date="@$dir_time" "$file_dir"
+				return 0
+			fi
+
 			if [[ -f "$par2_file" ]]; then
 				debug "Skipping $file: its par2 file already exists"
 				return 0
@@ -720,8 +1220,6 @@ process_single_file() {
 
 			debug "Par2 file will be: $par2_file"
 			debug "Processing file: $file"
-			local file_size=0
-			file_size=$($STAT -c%s "$file") # NOTE: this is expected to be GNU stat!
 			local block_size=0
 			block_size=$(calculate_block_size "$file_size")
 			debug "File size: $file_size bytes, Block size: $block_size bytes"
@@ -742,8 +1240,6 @@ process_single_file() {
 			fi
 
 			# Set the par2 files' timestamps to match the original file
-			local file_time
-			file_time=$($STAT -c%Y "$file") # NOTE: this is expected to be GNU stat!
 			debug "Setting timestamp $file_time on par2 files"
 			for par2f in "${par2_file%.*}".vol*.par2 "${par2_file%.*}".par2; do
 				debug "Setting timestamp on: $par2f"
@@ -784,6 +1280,29 @@ process_single_file() {
 
 		verify)
 			log_verbose "Verifying: $file"
+			if par2_store_is_sqlite; then
+				local tmpdir main_par2
+				if ! tmpdir=$(mktemp -d --tmpdir "brg_par2_verify.XXXXXX"); then
+					echo "Error: Failed to create temporary directory for sqlite par2 verify" >&2
+					return 1
+				fi
+				if ! main_par2=$(sqlite_materialize_latest_par2_set_for_file "$file" "$tmpdir"); then
+					rm -rf "$tmpdir"
+					return 0
+				fi
+				if ! $PAR2 verify -B"$file_dir" "$main_par2" "$file" >/dev/null; then
+					rm -rf "$tmpdir"
+					local canonical
+					if ! canonical=$(resolve_realpath "$file"); then
+						canonical="$file"
+					fi
+					echo "Verification failed for $canonical" >&2
+					return 1
+				fi
+				rm -rf "$tmpdir"
+				return 0
+			fi
+
 			[[ ! -f "$par2_file" ]] && return 0
 			debug "Verifying file: $file"
 			debug "Using par2 file: $par2_file"
@@ -833,6 +1352,27 @@ process_single_file() {
 
 		repair)
 			log_verbose "Repairing: $file"
+			if par2_store_is_sqlite; then
+				local tmpdir main_par2
+				if ! tmpdir=$(mktemp -d --tmpdir "brg_par2_repair.XXXXXX"); then
+					echo "Error: Failed to create temporary directory for sqlite par2 repair" >&2
+					return 1
+				fi
+				if ! main_par2=$(sqlite_materialize_latest_par2_set_for_file "$file" "$tmpdir"); then
+					rm -rf "$tmpdir"
+					return 0
+				fi
+				if ! $PAR2 repair -q -B"$file_dir" "$main_par2" "$file" >/dev/null; then
+					rm -rf "$tmpdir"
+					echo -e "\nError repairing $file" >&2
+					return 1
+				fi
+				rm -rf "$tmpdir"
+				echo "$file - Done."
+				$TOUCH -h --date="@$dir_time" "$file_dir"
+				return 0
+			fi
+
 			[[ ! -f "$par2_file" ]] && return 0
 			debug "Repairing file: $file"
 			debug "Using par2 file: $par2_file"
@@ -880,12 +1420,44 @@ process_single_file() {
 
 		clear)
 			log_verbose "Clearing protection for: $file"
+			if par2_store_is_sqlite; then
+				if ! sqlite_store_clear_for_file "$file"; then
+					return 1
+				fi
+				$TOUCH -h --date="@$dir_time" "$file_dir"
+				return 0
+			fi
+
 			remove_par2_files_for_file "$file"
 			$TOUCH -h --date="@$dir_time" "$file_dir"
 			;;
 
 		update)
 			log_verbose "Checking for updates: $file"
+			local file_size
+			file_size=$($STAT -c%s "$file") # NOTE: this is expected to be GNU stat!
+			if [[ "$file_size" -eq 0 ]]; then
+				process_single_file "$file" clear "$root"
+				process_single_file "$file" create "$root"
+				return $?
+			fi
+
+			if par2_store_is_sqlite; then
+				local file_time stored_time
+				file_time=$($STAT -c%Y "$file")
+				stored_time=$(sqlite_store_latest_mtime_for_file "$file" 2>/dev/null || true)
+				if [[ -z "${stored_time:-}" ]]; then
+					process_single_file "$file" create "$root"
+					return $?
+				fi
+				if (( file_time > stored_time )); then
+					process_single_file "$file" clear "$root"
+					process_single_file "$file" create "$root"
+					return $?
+				fi
+				return 0
+			fi
+
 			if [[ ! -f "$par2_file" ]]; then
 				process_single_file "$file" create "$root"
 				return $?
@@ -932,6 +1504,17 @@ process_single_file() {
 				local rsrc_size
 				rsrc_size=$($STAT -c%s "$resource_fork_path") # NOTE: this is expected to be GNU stat!
 				((total_size += rsrc_size))
+			fi
+
+			if par2_store_is_sqlite; then
+				local stored_time
+				stored_time=$(sqlite_store_latest_mtime_for_file "$file" 2>/dev/null || true)
+				if [[ -n "${stored_time:-}" ]]; then
+					echo "$total_size:covered"
+				else
+					echo "$total_size:uncovered"
+				fi
+				return 0
 			fi
 
 			if [[ -f "$par2_file" ]] && ( ! $has_rf || [[ -f "$resource_fork_par2_file" ]] ); then
@@ -1167,6 +1750,17 @@ clear_par2s() {
 		return 1
 	fi
 
+	if par2_store_is_sqlite; then
+		sqlite_clear_scope "$target"
+		while IFS= read -r -d '' marker; do
+			if should_ignore_path "$marker" "$target"; then
+				continue
+			fi
+			rm -f "$marker" 2>/dev/null || true
+		done < <(find "$target" -type f -name "*.brg_empty" -print0)
+		return $?
+	fi
+
 	debug "Target $target is a directory, processing files recursively"
 	while IFS= read -r -d '' par2_file; do
 		if should_ignore_path "$par2_file" "$target"; then
@@ -1271,6 +1865,7 @@ Commands:
   verify   Verify all par2 files in directory or a single file
   repair   Repair any corrupted files in directory or a single file
   clear    Remove all par2 files in directory or for a single file
+  prune    Remove par2 data with no source file
   stats    Show par2 coverage statistics for directory or a single file
   test     Run test suite
 
@@ -1291,13 +1886,17 @@ utilized. (There is some inevitable waste for really small files, though.)
 On macOS, it also does special handling around resource forks, which are not
 supported by par2 by default.
 
-The par2 files are created as hidden files (prefixed with '.', i.e., dotfiles)
-colocated in the same directory as the source files. (I decided this was a
-better strategy than putting them into a sqlite database or some other unified
-file or container.) Each set of one or more par2 files includes a default 5%
-redundancy. Block size is calculated as a percentage of the original file size
-using a double exponential decay formula (which was empirically determined
-to be the most effective, separately):
+By default, the par2 files are created as hidden files (prefixed with '.', i.e.,
+dotfiles) colocated in the same directory as the source files.
+
+Optionally, you can store the par2 files in a centralized sqlite database (see
+BRG_PAR2_STORE / --par2-store). When using sqlite storage, the database file is
+automatically excluded from protection (you can protect it separately).
+
+Each set of one or more par2 files includes a default 5% redundancy. Block size
+is calculated as a percentage of the original file size using a double
+exponential decay formula (which was empirically determined to be the most
+effective, separately):
   1.2: Base percentage (asymptotic minimum)
   2.0 * e^(-0.001 * k): Slow decay term for gradual reduction from 1MB to 10MB
   21 * e^(-0.3 * k): Fast decay term for steep initial drop from 1KB to 100KB
@@ -1331,6 +1930,11 @@ Environment Variables:
   BRG_IGNORE_PATTERNS  Colon-separated glob patterns to skip (works like PATH).
 					Defaults to ignoring .git/.jj directories (including nested ones).
 					Example: BRG_IGNORE_PATTERNS="*.bak:node_modules/**" ./${cmd_name} update /path
+  BRG_PAR2_STORE     Par2 storage backend: filesystem (default) or sqlite.
+					Example: BRG_PAR2_STORE=sqlite ./${cmd_name} create /path/to/dir
+  BRG_PAR2_DB_PATH   Path to sqlite db when BRG_PAR2_STORE=sqlite.
+					Defaults to ${XDG_DATA_HOME:-\$HOME/.local/share}/bitrot_guard/par2.sqlite3
+					Example: BRG_PAR2_DB_PATH=~/brg.sqlite3 BRG_PAR2_STORE=sqlite ./${cmd_name} create /path/to/dir
 
 Ignore patterns can also be listed one per line in
   ${XDG_CONFIG_HOME:-\$HOME/.config}/bitrot_guard/ignore
@@ -1354,6 +1958,32 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
 		case "$1" in
 			-v|--verbose)
 				VERBOSE=1
+				shift
+				;;
+			--par2-store)
+				shift
+				if [[ $# -lt 1 || -z "${1:-}" ]]; then
+					echo "Error: --par2-store requires a value (filesystem|sqlite)." >&2
+					exit 1
+				fi
+				BRG_PAR2_STORE="$1"
+				shift
+				;;
+			--par2-store=*)
+				BRG_PAR2_STORE="${1#--par2-store=}"
+				shift
+				;;
+			--par2-db|--par2-sqlite-db|--par2-sqlite-path)
+				shift
+				if [[ $# -lt 1 || -z "${1:-}" ]]; then
+					echo "Error: --par2-db requires a path." >&2
+					exit 1
+				fi
+				BRG_PAR2_DB_PATH="$1"
+				shift
+				;;
+			--par2-db=*|--par2-sqlite-db=*|--par2-sqlite-path=*)
+				BRG_PAR2_DB_PATH="${1#*=}"
 				shift
 				;;
 			*)
@@ -1430,12 +2060,17 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
 			queue_files_command "$mode" "$target"
 			exit $?
 			;;
-		create|update|verify|repair|clear|stats)
+		create|update|verify|repair|clear|stats|prune)
 			if [[ -z "$directory" ]]; then
 				echo -ne "Error: No target specified. Please provide a file or directory path.\n\n" >&2
 				show_help
 				exit 1
 			fi
+			if [[ "$command" == "prune" ]]; then
+				brg_store_prune_scope "$directory"
+				exit $?
+			fi
+
 			"${command}_par2s" "$directory"
 			exit $?
 			;;

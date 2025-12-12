@@ -6,6 +6,16 @@
    - Status: Completed (tests cover symlinked `--test` usage).
 2. Evaluate concurrency and performance strategies for scaling to thousands of files.
    - Status: Completed; see notes below for short-term and long-term options.
+3. Add optional centralized sqlite par2 storage.
+   - Status: Completed (create/verify/repair/update/clear support; db excluded from protection; CLI flags and env vars).
+4. Add a prune command for orphaned par2 data.
+   - Status: Completed (filesystem: removes orphan `.par2` files; sqlite: removes rows whose source files are missing).
+5. Explore compression of stored par2 data (spike).
+   - Status: Planned.
+   - Idea: build a zstd dictionary trained on existing `.par2` corpus; store `codec` + `dict_id` per blob; measure size/time wins.
+6. Explore sqlite storage fallback when `readfile()/writefile()` are unavailable (spike).
+   - Status: Planned.
+   - Idea: evaluate `printable_binary` encoding pipeline and/or a small compiled helper for streaming inserts/extracts without giant SQL literals.
 
 ## Notes
 

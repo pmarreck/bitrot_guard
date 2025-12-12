@@ -50,12 +50,17 @@ This tool provides a middle ground: bitrot protection for long-term archiving wi
 ```bash
 ./bitrot_guard <command> <target>
 
+Global options:
+  --par2-store filesystem|sqlite
+  --par2-db <path>  (only used when --par2-store sqlite)
+
 Commands:
   create  - Create par2 files for target file/directory
   verify  - Check integrity of target using par2 files
   repair  - Attempt to repair any corruption detected
   update  - Update par2 files if target has changed
   clear   - Remove all par2 files
+  prune   - Remove par2 data with no source file (filesystem or sqlite)
   stats   - Show protection coverage statistics
   test    - Run the test suite (or run `./test/test.sh` directly)
   about   - Show a one-line project description
@@ -66,6 +71,8 @@ Commands:
 - `NUM_PAR2_THREADS`: Number of threads for par2 (default: CPU core count)
 - `BRG_REDUNDANCY`: Percentage of redundancy (default: 5)
 - `PROTECT_DOTFILES`: Whether to protect hidden files (default: 1)
+- `BRG_PAR2_STORE`: Par2 storage backend (`filesystem` default, or `sqlite`)
+- `BRG_PAR2_DB_PATH`: Path to sqlite db when `BRG_PAR2_STORE=sqlite` (default: `$XDG_DATA_HOME/bitrot_guard/par2.sqlite3` or `~/.local/share/bitrot_guard/par2.sqlite3`)
 - `BRG_DEFAULT_IGNORE_PATTERNS`: Colon-separated glob patterns that replace the built-in defaults. If unset, defaults ignore common VCS/build/cache artifacts such as `.git/**`, `.jj/**`, `.elixir_ls/**`, `_build/**`, `node_modules/**`, `deps/**`, `target/**`, `dist/**`, `build/**`, virtualenvs (`.venv/**`, `venv/**`), Python caches (`__pycache__`, `.mypy_cache`, `.pytest_cache`), `.tox`, `.bundle`, `vendor/bundle`, `.cache`, `.parcel-cache`, `.angular/cache`, `.gradle`, `cmake-build-*`, `out`, `.idea`, `.vscode`, and `.DS_Store`.
 - `BRG_ADDITIONAL_IGNORE_PATTERNS`: Colon-separated globs appended after the defaults (or after `BRG_DEFAULT_IGNORE_PATTERNS` when it is set).
 - `BRG_IGNORE_PATTERNS`: Colon-separated globs appended last. Useful for per-invocation overrides. Example: `BRG_IGNORE_PATTERNS="*.bak:node_modules/**"`.
