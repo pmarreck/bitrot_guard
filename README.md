@@ -87,6 +87,7 @@ By default, `BRG_PAR2_STORE=auto`, and the storage backend can be selected by pa
 
 Config file:
 - `$XDG_CONFIG_HOME/bitrot_guard/config.toml` (or `~/.config/bitrot_guard/config.toml`)
+  - Override with `BRG_CONFIG_FILE=/path/to/config.toml`
 
 Example:
 ```toml

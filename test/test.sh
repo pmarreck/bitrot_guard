@@ -706,6 +706,38 @@ test_cli_config_list_stores_outputs_rules() {
 }
 register_test test_cli_config_list_stores_outputs_rules
 
+test_store_config_file_env_var_overrides_xdg_location() {
+	log "test_store_config_file_env_var_overrides_xdg_location"
+	local dir sub file xdg config_file db
+	dir=$(make_temp_dir)
+	sub="$dir/sub"
+	mkdir -p "$sub"
+	file="$sub/file.txt"
+	echo "hi" > "$file"
+
+	xdg=$(make_temp_dir)
+	config_file="$xdg/custom_config.toml"
+	db="$xdg/custom.sqlite3"
+
+	cat >"$config_file" <<EOF
+[[store]]
+scope = "$dir"
+backend = "sqlite"
+db_path = "$db"
+EOF
+
+	XDG_CONFIG_HOME="$xdg" BRG_CONFIG_FILE="$config_file" run_quiet create "$dir"
+	if find "$dir" -name "*.par2" -print -quit | grep -q .; then
+		fail "Did not expect filesystem par2 files under sqlite-scoped $dir via BRG_CONFIG_FILE"
+		return 1
+	fi
+	if [[ ! -f "$db" ]]; then
+		fail "Expected sqlite db at $db via BRG_CONFIG_FILE"
+		return 1
+	fi
+}
+register_test test_store_config_file_env_var_overrides_xdg_location
+
 test_filesystem_prune_removes_orphaned_par2_files() {
 	log "test_filesystem_prune_removes_orphaned_par2_files"
 	local dir file

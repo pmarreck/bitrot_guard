@@ -436,7 +436,11 @@ brg_store_config_dir() {
 }
 
 brg_store_config_file() {
-	printf '%s/config.toml\n' "$(brg_store_config_dir)"
+	if [[ -n "${BRG_CONFIG_FILE:-}" ]]; then
+		brg_make_abs_path "$BRG_CONFIG_FILE"
+	else
+		printf '%s/config.toml\n' "$(brg_store_config_dir)"
+	fi
 }
 
 BRG_STORE_RULES_LOADED=0
@@ -2313,6 +2317,7 @@ Environment Variables:
 
 Store scoping can be configured in:
   ${XDG_CONFIG_HOME:-\$HOME/.config}/bitrot_guard/config.toml
+  (override with BRG_CONFIG_FILE=/path/to/config.toml)
 
 Example:
   [[store]]
