@@ -55,6 +55,7 @@ Global options:
   --par2-db <path>  (only used when --par2-store sqlite)
 
 Commands:
+  config  - Configure store backend scoping
   create  - Create par2 files for target file/directory
   verify  - Check integrity of target using par2 files
   repair  - Attempt to repair any corruption detected
@@ -79,6 +80,31 @@ Commands:
 
 Ignore patterns can also be stored one per line (with `#` comments) in `"$XDG_CONFIG_HOME/bitrot_guard/ignore"` or `~/.config/bitrot_guard/ignore`.
 - `DEBUG`: Set to 1 to enable verbose debug output
+
+## Store Backend Scoping (TOML)
+
+By default, `BRG_PAR2_STORE=auto`, and the storage backend can be selected by path scope rules.
+
+Config file:
+- `$XDG_CONFIG_HOME/bitrot_guard/config.toml` (or `~/.config/bitrot_guard/config.toml`)
+
+Example:
+```toml
+[[store]]
+scope = "/"
+backend = "filesystem"
+
+[[store]]
+scope = "/Applications"
+backend = "sqlite"
+db_path = "/path/to/par2.sqlite3"
+```
+
+Commands:
+```bash
+./bitrot_guard config set-store --scope /Applications --backend sqlite --db ~/brg.sqlite3
+./bitrot_guard config list-stores
+```
 
 ## How It Works
 

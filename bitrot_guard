@@ -2234,6 +2234,7 @@ Usage: $cmd_name <command> [<file_or_directory>]
 Commands:
   help     Display this help message
   about    Show a one-line description of Bitrot Guard
+  config   Configure store backend scoping
   create   Create par2 files for all files in directory or a single file
   update   Update par2 files for modified files in directory or a single file
   verify   Verify all par2 files in directory or a single file
@@ -2304,11 +2305,26 @@ Environment Variables:
   BRG_IGNORE_PATTERNS  Colon-separated glob patterns to skip (works like PATH).
 					Defaults to ignoring .git/.jj directories (including nested ones).
 					Example: BRG_IGNORE_PATTERNS="*.bak:node_modules/**" ./${cmd_name} update /path
-  BRG_PAR2_STORE     Par2 storage backend: filesystem (default) or sqlite.
+  BRG_PAR2_STORE     Par2 storage backend: auto (default), filesystem, or sqlite.
 					Example: BRG_PAR2_STORE=sqlite ./${cmd_name} create /path/to/dir
-  BRG_PAR2_DB_PATH   Path to sqlite db when BRG_PAR2_STORE=sqlite.
+  BRG_PAR2_DB_PATH   Path to sqlite db when BRG_PAR2_STORE=sqlite or when a store rule uses sqlite without an explicit db_path.
 					Defaults to ${XDG_DATA_HOME:-\$HOME/.local/share}/bitrot_guard/par2.sqlite3
 					Example: BRG_PAR2_DB_PATH=~/brg.sqlite3 BRG_PAR2_STORE=sqlite ./${cmd_name} create /path/to/dir
+
+Store scoping can be configured in:
+  ${XDG_CONFIG_HOME:-\$HOME/.config}/bitrot_guard/config.toml
+
+Example:
+  [[store]]
+  scope = "/"
+  backend = "filesystem"
+
+  [[store]]
+  scope = "/Applications"
+  backend = "sqlite"
+  db_path = "/path/to/par2.sqlite3"
+
+The most-specific (longest) matching scope wins.
 
 Ignore patterns can also be listed one per line in
   ${XDG_CONFIG_HOME:-\$HOME/.config}/bitrot_guard/ignore
@@ -2322,6 +2338,18 @@ package manager (although in the case of Linux, these are likely the default).
 It is assumed that these tools are available in the PATH via gstat, gtouch
 and sed. (On Nix[OS]/nix-darwin, the coreutils-prefixed package provides this,
 in case you don't want to shadow the BSD versions, which I recommend.)
+EOF
+}
+
+show_config_help() {
+	local cmd_name
+	cmd_name=$(basename "$0")
+	cat >&2 <<EOF
+${cmd_name} config - Configure store backend scoping
+
+Usage:
+  ${cmd_name} config set-store --scope <path> --backend filesystem|sqlite [--db <path>]
+  ${cmd_name} config list-stores
 EOF
 }
 
@@ -2437,6 +2465,10 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
 		config)
 			subcommand="${2:-}"
 			case "$subcommand" in
+				""|-h|--help|help)
+					show_config_help
+					exit 0
+					;;
 				set-store)
 					shift 2
 					if ! brg_store_config_set_store "$@"; then
@@ -2450,7 +2482,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
 					;;
 				*)
 					echo -ne "Error: Unknown config subcommand '$subcommand'.\n\n" >&2
-					show_help
+					show_config_help
 					exit 1
 					;;
 			esac
