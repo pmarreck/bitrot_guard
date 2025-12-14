@@ -426,6 +426,10 @@ par2_store_is_sqlite() {
 	[[ "${BRG_PAR2_STORE:-filesystem}" == "sqlite" ]]
 }
 
+brg_store_backend() {
+	printf '%s\n' "${BRG_PAR2_STORE:-filesystem}"
+}
+
 brg_default_par2_db_path() {
 	local data_home="${XDG_DATA_HOME:-$HOME/.local/share}"
 	printf '%s\n' "$data_home/bitrot_guard/par2.sqlite3"
@@ -499,6 +503,47 @@ sqlite_require_fileio_functions() {
 	fi
 	rm -f "$tmp_probe" 2>/dev/null || true
 	return 0
+}
+
+brg_store_create_for_file() {
+	local file="$1"
+
+	if [[ "$(brg_store_backend)" == "sqlite" ]]; then
+		sqlite_store_create_for_file "$file"
+	else
+		return 2
+	fi
+}
+
+brg_store_materialize_latest_par2_set_for_file() {
+	local file="$1"
+	local tmpdir="$2"
+
+	if [[ "$(brg_store_backend)" == "sqlite" ]]; then
+		sqlite_materialize_latest_par2_set_for_file "$file" "$tmpdir"
+	else
+		return 2
+	fi
+}
+
+brg_store_clear_for_file() {
+	local file="$1"
+
+	if [[ "$(brg_store_backend)" == "sqlite" ]]; then
+		sqlite_store_clear_for_file "$file"
+	else
+		return 2
+	fi
+}
+
+brg_store_latest_mtime_for_file() {
+	local file="$1"
+
+	if [[ "$(brg_store_backend)" == "sqlite" ]]; then
+		sqlite_store_latest_mtime_for_file "$file"
+	else
+		return 2
+	fi
 }
 
 sqlite_store_par2_file() {
@@ -1204,8 +1249,8 @@ process_single_file() {
 				return 0
 			fi
 
-			if par2_store_is_sqlite; then
-				if ! sqlite_store_create_for_file "$file"; then
+			if [[ "$(brg_store_backend)" == "sqlite" ]]; then
+				if ! brg_store_create_for_file "$file"; then
 					return 1
 				fi
 				echo "$file - Done."
@@ -1280,13 +1325,13 @@ process_single_file() {
 
 		verify)
 			log_verbose "Verifying: $file"
-			if par2_store_is_sqlite; then
+			if [[ "$(brg_store_backend)" == "sqlite" ]]; then
 				local tmpdir main_par2
 				if ! tmpdir=$(mktemp -d --tmpdir "brg_par2_verify.XXXXXX"); then
 					echo "Error: Failed to create temporary directory for sqlite par2 verify" >&2
 					return 1
 				fi
-				if ! main_par2=$(sqlite_materialize_latest_par2_set_for_file "$file" "$tmpdir"); then
+				if ! main_par2=$(brg_store_materialize_latest_par2_set_for_file "$file" "$tmpdir"); then
 					rm -rf "$tmpdir"
 					return 0
 				fi
@@ -1352,13 +1397,13 @@ process_single_file() {
 
 		repair)
 			log_verbose "Repairing: $file"
-			if par2_store_is_sqlite; then
+			if [[ "$(brg_store_backend)" == "sqlite" ]]; then
 				local tmpdir main_par2
 				if ! tmpdir=$(mktemp -d --tmpdir "brg_par2_repair.XXXXXX"); then
 					echo "Error: Failed to create temporary directory for sqlite par2 repair" >&2
 					return 1
 				fi
-				if ! main_par2=$(sqlite_materialize_latest_par2_set_for_file "$file" "$tmpdir"); then
+				if ! main_par2=$(brg_store_materialize_latest_par2_set_for_file "$file" "$tmpdir"); then
 					rm -rf "$tmpdir"
 					return 0
 				fi
@@ -1420,8 +1465,8 @@ process_single_file() {
 
 		clear)
 			log_verbose "Clearing protection for: $file"
-			if par2_store_is_sqlite; then
-				if ! sqlite_store_clear_for_file "$file"; then
+			if [[ "$(brg_store_backend)" == "sqlite" ]]; then
+				if ! brg_store_clear_for_file "$file"; then
 					return 1
 				fi
 				$TOUCH -h --date="@$dir_time" "$file_dir"
@@ -1442,10 +1487,10 @@ process_single_file() {
 				return $?
 			fi
 
-			if par2_store_is_sqlite; then
+			if [[ "$(brg_store_backend)" == "sqlite" ]]; then
 				local file_time stored_time
 				file_time=$($STAT -c%Y "$file")
-				stored_time=$(sqlite_store_latest_mtime_for_file "$file" 2>/dev/null || true)
+				stored_time=$(brg_store_latest_mtime_for_file "$file" 2>/dev/null || true)
 				if [[ -z "${stored_time:-}" ]]; then
 					process_single_file "$file" create "$root"
 					return $?
@@ -1506,9 +1551,9 @@ process_single_file() {
 				((total_size += rsrc_size))
 			fi
 
-			if par2_store_is_sqlite; then
+			if [[ "$(brg_store_backend)" == "sqlite" ]]; then
 				local stored_time
-				stored_time=$(sqlite_store_latest_mtime_for_file "$file" 2>/dev/null || true)
+				stored_time=$(brg_store_latest_mtime_for_file "$file" 2>/dev/null || true)
 				if [[ -n "${stored_time:-}" ]]; then
 					echo "$total_size:covered"
 				else
