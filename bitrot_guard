@@ -812,7 +812,7 @@ sqlite_clear_scope() {
 
 brg_store_prune_scope() {
 	local target="$1"
-	if par2_store_is_sqlite; then
+	if [[ "$(brg_store_backend)" == "sqlite" ]]; then
 		sqlite_prune_missing_sources "$target"
 	else
 		filesystem_prune_orphaned_par2s "$target"
@@ -821,7 +821,7 @@ brg_store_prune_scope() {
 
 brg_store_clear_scope() {
 	local target="$1"
-	if par2_store_is_sqlite; then
+	if [[ "$(brg_store_backend)" == "sqlite" ]]; then
 		sqlite_clear_scope "$target"
 		if [[ -d "$target" ]]; then
 			while IFS= read -r -d '' marker; do
@@ -832,8 +832,28 @@ brg_store_clear_scope() {
 			done < <(find "$target" -type f -name "*.brg_empty" -print0)
 		fi
 	else
-		clear_par2s "$target"
+		filesystem_clear_scope "$target"
 	fi
+}
+
+filesystem_clear_scope() {
+	local target="$1"
+
+	debug "Attempting filesystem clear on target: $target"
+
+	if [[ ! -d "$target" ]]; then
+		echo "Error: $target is not a directory" >&2
+		return 1
+	fi
+
+	while IFS= read -r -d '' par2_file; do
+		if should_ignore_path "$par2_file" "$target"; then
+			debug "Skipping removal inside ignored path: $par2_file"
+			continue
+		fi
+		echo "Removing: $par2_file"
+		rm "$par2_file"
+	done < <(find "$target" -type f -name "*.par2" -print0)
 }
 
 filesystem_prune_orphaned_par2s() {
@@ -1795,26 +1815,7 @@ clear_par2s() {
 		return 1
 	fi
 
-	if par2_store_is_sqlite; then
-		sqlite_clear_scope "$target"
-		while IFS= read -r -d '' marker; do
-			if should_ignore_path "$marker" "$target"; then
-				continue
-			fi
-			rm -f "$marker" 2>/dev/null || true
-		done < <(find "$target" -type f -name "*.brg_empty" -print0)
-		return $?
-	fi
-
-	debug "Target $target is a directory, processing files recursively"
-	while IFS= read -r -d '' par2_file; do
-		if should_ignore_path "$par2_file" "$target"; then
-			debug "Skipping removal inside ignored path: $par2_file"
-			continue
-		fi
-		echo "Removing: $par2_file"
-		rm "$par2_file"
-	done < <(find "$target" -type f -name "*.par2" -print0)
+	brg_store_clear_scope "$target"
 }
 
 # Calculate par2 coverage statistics
