@@ -612,6 +612,100 @@ EOF
 }
 register_test test_sqlite_store_errors_gracefully_without_readfile_writefile
 
+test_scoped_store_config_uses_most_specific_match() {
+	log "test_scoped_store_config_uses_most_specific_match"
+	local dir sub file_root file_sub xdg config_dir config_file db
+	dir=$(make_temp_dir)
+	sub="$dir/sub"
+	mkdir -p "$sub"
+	file_root="$dir/root.txt"
+	file_sub="$sub/sub.txt"
+	echo "root" > "$file_root"
+	echo "sub" > "$file_sub"
+
+	xdg=$(make_temp_dir)
+	config_dir="$xdg/bitrot_guard"
+	mkdir -p "$config_dir"
+	config_file="$config_dir/config.toml"
+	db="$xdg/brg_scoped.sqlite3"
+
+	cat >"$config_file" <<EOF
+[[store]]
+scope = "$dir"
+backend = "filesystem"
+
+[[store]]
+scope = "$sub"
+backend = "sqlite"
+db_path = "$db"
+EOF
+
+	XDG_CONFIG_HOME="$xdg" run_quiet create "$dir"
+
+	if [[ ! -f "$dir/.root.txt.par2" ]]; then
+		fail "Expected filesystem par2 for $file_root"
+		return 1
+	fi
+
+	if find "$sub" -name "*.par2" -print -quit | grep -q .; then
+		fail "Did not expect filesystem par2 files under sqlite-scoped $sub"
+		return 1
+	fi
+	if [[ ! -f "$db" ]]; then
+		fail "Expected sqlite db at $db"
+		return 1
+	fi
+	if [[ "$(sqlite3 "$db" "select count(*) from brg_par2_files;")" -lt 1 ]]; then
+		fail "Expected rows in sqlite db for $file_sub"
+		return 1
+	fi
+}
+register_test test_scoped_store_config_uses_most_specific_match
+
+test_cli_config_set_store_writes_toml() {
+	log "test_cli_config_set_store_writes_toml"
+	local dir file xdg db config_file
+	dir=$(make_temp_dir)
+	file="$dir/a.txt"
+	echo "hi" > "$file"
+	xdg=$(make_temp_dir)
+	db="$xdg/cli_config.sqlite3"
+	config_file="$xdg/bitrot_guard/config.toml"
+
+	XDG_CONFIG_HOME="$xdg" "$TARGET_BIN" config set-store --scope "$dir" --backend sqlite --db "$db" >/dev/null 2>&1
+	if [[ ! -f "$config_file" ]]; then
+		fail "Expected config file at $config_file"
+		return 1
+	fi
+
+	XDG_CONFIG_HOME="$xdg" run_quiet create "$file"
+	if find "$dir" -name "*.par2" -print -quit | grep -q .; then
+		fail "Did not expect filesystem par2 files under sqlite-scoped $dir"
+		return 1
+	fi
+	if [[ ! -f "$db" ]]; then
+		fail "Expected sqlite db at $db"
+		return 1
+	fi
+}
+register_test test_cli_config_set_store_writes_toml
+
+test_cli_config_list_stores_outputs_rules() {
+	log "test_cli_config_list_stores_outputs_rules"
+	local dir xdg db out
+	dir=$(make_temp_dir)
+	xdg=$(make_temp_dir)
+	db="$xdg/list.sqlite3"
+
+	XDG_CONFIG_HOME="$xdg" "$TARGET_BIN" config set-store --scope "$dir" --backend sqlite --db "$db" >/dev/null 2>&1
+	out=$(XDG_CONFIG_HOME="$xdg" "$TARGET_BIN" config list-stores 2>/dev/null)
+	if [[ "$out" != *"$dir"* || "$out" != *"sqlite"* ]]; then
+		fail "Expected config list-stores output to include scope and backend"
+		return 1
+	fi
+}
+register_test test_cli_config_list_stores_outputs_rules
+
 test_filesystem_prune_removes_orphaned_par2_files() {
 	log "test_filesystem_prune_removes_orphaned_par2_files"
 	local dir file

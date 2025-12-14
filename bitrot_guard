@@ -326,7 +326,7 @@ resolve_realpath() {
 VERBOSE=${VERBOSE:-0}
 BRG_REDUNDANCY=${BRG_REDUNDANCY:-5}
 PROTECT_DOTFILES=${PROTECT_DOTFILES:-1}
-BRG_PAR2_STORE=${BRG_PAR2_STORE:-filesystem}
+BRG_PAR2_STORE=${BRG_PAR2_STORE:-auto}
 BRG_PAR2_DB_PATH=${BRG_PAR2_DB_PATH:-}
 PROJECT_DESCRIPTION="Bitrot Guard creates and uses par2 redundancy to detect and repair bitrot in your files and directories."
 declare -a DEFAULT_IGNORE_PATTERNS=(
@@ -430,6 +430,326 @@ brg_store_backend() {
 	printf '%s\n' "${BRG_PAR2_STORE:-filesystem}"
 }
 
+brg_store_config_dir() {
+	local config_home="${XDG_CONFIG_HOME:-$HOME/.config}"
+	printf '%s\n' "$config_home/bitrot_guard"
+}
+
+brg_store_config_file() {
+	printf '%s/config.toml\n' "$(brg_store_config_dir)"
+}
+
+BRG_STORE_RULES_LOADED=0
+declare -a BRG_STORE_RULE_SCOPES=()
+declare -a BRG_STORE_RULE_BACKENDS=()
+declare -a BRG_STORE_RULE_DB_PATHS=()
+
+brg_store_reset_rules_cache() {
+	BRG_STORE_RULES_LOADED=0
+	BRG_STORE_RULE_SCOPES=()
+	BRG_STORE_RULE_BACKENDS=()
+	BRG_STORE_RULE_DB_PATHS=()
+}
+
+brg_make_abs_path() {
+	local path="$1"
+	if [[ -z "$path" ]]; then
+		return 1
+	fi
+	if [[ "$path" == /* ]]; then
+		printf '%s\n' "$path"
+	else
+		printf '%s\n' "$PWD/$path"
+	fi
+}
+
+brg_store_load_rules() {
+	if [[ "$BRG_STORE_RULES_LOADED" -eq 1 ]]; then
+		return 0
+	fi
+
+	local file
+	file=$(brg_store_config_file)
+	if [[ ! -f "$file" ]]; then
+		BRG_STORE_RULES_LOADED=1
+		return 0
+	fi
+
+	local in_store=0
+	local scope="" backend="" db_path=""
+	while IFS= read -r line || [[ -n "$line" ]]; do
+		line="${line%%#*}"
+		line="${line%"${line##*[![:space:]]}"}"
+		line="${line#"${line%%[![:space:]]*}"}"
+		[[ -z "$line" ]] && continue
+
+		if [[ "$line" == "[[store]]" ]]; then
+			if [[ "$in_store" -eq 1 && -n "$scope" && -n "$backend" ]]; then
+				BRG_STORE_RULE_SCOPES+=("$scope")
+				BRG_STORE_RULE_BACKENDS+=("$backend")
+				BRG_STORE_RULE_DB_PATHS+=("${db_path:-}")
+			fi
+			in_store=1
+			scope=""
+			backend=""
+			db_path=""
+			continue
+		fi
+
+		[[ "$in_store" -eq 1 ]] || continue
+
+		local key value
+		key="${line%%=*}"
+		value="${line#*=}"
+		key="${key%"${key##*[![:space:]]}"}"
+		key="${key#"${key%%[![:space:]]*}"}"
+		value="${value%"${value##*[![:space:]]}"}"
+		value="${value#"${value%%[![:space:]]*}"}"
+		if [[ "$value" == \"*\" && "$value" == *\" ]]; then
+			value="${value#\"}"
+			value="${value%\"}"
+		fi
+
+		case "$key" in
+			scope)
+				scope=$(brg_make_abs_path "$value")
+				if scope=$(resolve_realpath "$scope" 2>/dev/null); then
+					:
+				fi
+				scope="${scope%/}"
+				;;
+			backend)
+				backend="$value"
+				;;
+			db_path)
+				db_path=$(brg_make_abs_path "$value")
+				;;
+		esac
+	done < "$file"
+
+	if [[ "$in_store" -eq 1 && -n "$scope" && -n "$backend" ]]; then
+		BRG_STORE_RULE_SCOPES+=("$scope")
+		BRG_STORE_RULE_BACKENDS+=("$backend")
+		BRG_STORE_RULE_DB_PATHS+=("${db_path:-}")
+	fi
+
+	BRG_STORE_RULES_LOADED=1
+	return 0
+}
+
+brg_store_write_rules() {
+	local file
+	file=$(brg_store_config_file)
+	local dir
+	dir=$(dirname "$file")
+	mkdir -p "$dir"
+
+	{
+		printf '# bitrot_guard store configuration\n'
+		printf '# Each [[store]] entry matches a scope prefix; the most-specific (longest) scope wins.\n\n'
+		for ((i=0; i<${#BRG_STORE_RULE_SCOPES[@]}; i++)); do
+			local scope backend_rule db_rule
+			scope="${BRG_STORE_RULE_SCOPES[i]}"
+			backend_rule="${BRG_STORE_RULE_BACKENDS[i]}"
+			db_rule="${BRG_STORE_RULE_DB_PATHS[i]}"
+			[[ -z "$scope" || -z "$backend_rule" ]] && continue
+			printf '[[store]]\n'
+			printf 'scope = "%s"\n' "$scope"
+			printf 'backend = "%s"\n' "$backend_rule"
+			if [[ -n "${db_rule:-}" ]]; then
+				printf 'db_path = "%s"\n' "$db_rule"
+			fi
+			printf '\n'
+		done
+	} > "$file"
+}
+
+brg_store_config_set_store() {
+	local scope="" backend="" db_path=""
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+			--scope)
+				shift
+				scope="${1:-}"
+				shift
+				;;
+			--backend)
+				shift
+				backend="${1:-}"
+				shift
+				;;
+			--db|--db-path|--par2-db)
+				shift
+				db_path="${1:-}"
+				shift
+				;;
+			*)
+				echo "Error: Unknown config set-store argument '$1'." >&2
+				return 1
+				;;
+		esac
+	done
+
+	if [[ -z "$scope" || -z "$backend" ]]; then
+		echo "Error: config set-store requires --scope and --backend." >&2
+		return 1
+	fi
+	if [[ "$backend" != "filesystem" && "$backend" != "sqlite" ]]; then
+		echo "Error: backend must be 'filesystem' or 'sqlite'." >&2
+		return 1
+	fi
+
+	local scope_abs
+	if ! scope_abs=$(brg_make_abs_path "$scope"); then
+		echo "Error: invalid scope path." >&2
+		return 1
+	fi
+	if scope_abs=$(resolve_realpath "$scope_abs" 2>/dev/null); then
+		:
+	fi
+	scope_abs="${scope_abs%/}"
+
+	local db_abs=""
+	if [[ -n "${db_path:-}" ]]; then
+		if ! db_abs=$(brg_make_abs_path "$db_path"); then
+			echo "Error: invalid db path." >&2
+			return 1
+		fi
+	fi
+
+	brg_store_load_rules
+
+	local updated=0
+	for ((i=0; i<${#BRG_STORE_RULE_SCOPES[@]}; i++)); do
+		if [[ "${BRG_STORE_RULE_SCOPES[i]}" == "$scope_abs" ]]; then
+			BRG_STORE_RULE_BACKENDS[i]="$backend"
+			BRG_STORE_RULE_DB_PATHS[i]="${db_abs:-}"
+			updated=1
+			break
+		fi
+	done
+	if [[ "$updated" -eq 0 ]]; then
+		BRG_STORE_RULE_SCOPES+=("$scope_abs")
+		BRG_STORE_RULE_BACKENDS+=("$backend")
+		BRG_STORE_RULE_DB_PATHS+=("${db_abs:-}")
+	fi
+
+	brg_store_write_rules
+	brg_store_reset_rules_cache
+	return 0
+}
+
+brg_store_config_list_stores() {
+	brg_store_load_rules
+	for ((i=0; i<${#BRG_STORE_RULE_SCOPES[@]}; i++)); do
+		local scope backend_rule db_rule
+		scope="${BRG_STORE_RULE_SCOPES[i]}"
+		backend_rule="${BRG_STORE_RULE_BACKENDS[i]}"
+		db_rule="${BRG_STORE_RULE_DB_PATHS[i]}"
+		[[ -z "$scope" || -z "$backend_rule" ]] && continue
+		printf '%s\t%s\t%s\n' "$scope" "$backend_rule" "${db_rule:-}"
+	done
+}
+
+brg_store_backend_for_path() {
+	local path="$1"
+	local forced
+	forced=$(brg_store_backend)
+	case "$forced" in
+		filesystem|sqlite)
+			printf '%s\n' "$forced"
+			return 0
+			;;
+		auto|"")
+			;;
+		*)
+			printf '%s\n' "filesystem"
+			return 0
+			;;
+	esac
+
+	local abs
+	if ! abs=$(brg_make_abs_path "$path"); then
+		printf '%s\n' "filesystem"
+		return 0
+	fi
+	if abs=$(resolve_realpath "$abs" 2>/dev/null); then
+		:
+	fi
+	abs="${abs%/}"
+
+	brg_store_load_rules
+
+	local best_backend="" best_len=-1
+	for ((i=0; i<${#BRG_STORE_RULE_SCOPES[@]}; i++)); do
+		local scope backend_rule
+		scope="${BRG_STORE_RULE_SCOPES[i]}"
+		backend_rule="${BRG_STORE_RULE_BACKENDS[i]}"
+		[[ -z "$scope" || -z "$backend_rule" ]] && continue
+		if [[ "$abs" == "$scope" || "$abs" == "$scope"/* ]]; then
+			local len=${#scope}
+			if (( len > best_len )); then
+				best_len=$len
+				best_backend="$backend_rule"
+			fi
+		fi
+	done
+
+	if [[ -n "$best_backend" ]]; then
+		printf '%s\n' "$best_backend"
+	else
+		printf '%s\n' "filesystem"
+	fi
+}
+
+brg_store_db_path_for_path() {
+	local path="$1"
+
+	local forced
+	forced=$(brg_store_backend)
+	if [[ "$forced" == "sqlite" && -n "${BRG_PAR2_DB_PATH:-}" ]]; then
+		brg_make_abs_path "$BRG_PAR2_DB_PATH"
+		return 0
+	fi
+
+	local abs
+	if ! abs=$(brg_make_abs_path "$path"); then
+		brg_make_abs_path "$(brg_default_par2_db_path)"
+		return 0
+	fi
+	if abs=$(resolve_realpath "$abs" 2>/dev/null); then
+		:
+	fi
+	abs="${abs%/}"
+
+	brg_store_load_rules
+
+	local best_db="" best_len=-1
+	for ((i=0; i<${#BRG_STORE_RULE_SCOPES[@]}; i++)); do
+		local scope backend_rule db_rule
+		scope="${BRG_STORE_RULE_SCOPES[i]}"
+		backend_rule="${BRG_STORE_RULE_BACKENDS[i]}"
+		db_rule="${BRG_STORE_RULE_DB_PATHS[i]}"
+		[[ -z "$scope" || -z "$backend_rule" ]] && continue
+		[[ "$backend_rule" == "sqlite" ]] || continue
+		if [[ "$abs" == "$scope" || "$abs" == "$scope"/* ]]; then
+			local len=${#scope}
+			if (( len > best_len )); then
+				best_len=$len
+				best_db="$db_rule"
+			fi
+		fi
+	done
+
+	if [[ -n "$best_db" ]]; then
+		printf '%s\n' "$best_db"
+	elif [[ -n "${BRG_PAR2_DB_PATH:-}" ]]; then
+		brg_make_abs_path "$BRG_PAR2_DB_PATH"
+	else
+		brg_default_par2_db_path
+	fi
+}
+
 brg_default_par2_db_path() {
 	local data_home="${XDG_DATA_HOME:-$HOME/.local/share}"
 	printf '%s\n' "$data_home/bitrot_guard/par2.sqlite3"
@@ -508,8 +828,10 @@ sqlite_require_fileio_functions() {
 brg_store_create_for_file() {
 	local file="$1"
 
-	if [[ "$(brg_store_backend)" == "sqlite" ]]; then
-		sqlite_store_create_for_file "$file"
+	if [[ "$(brg_store_backend_for_path "$file")" == "sqlite" ]]; then
+		local db
+		db=$(brg_store_db_path_for_path "$file")
+		BRG_PAR2_DB_PATH="$db" sqlite_store_create_for_file "$file"
 	else
 		return 2
 	fi
@@ -519,8 +841,10 @@ brg_store_materialize_latest_par2_set_for_file() {
 	local file="$1"
 	local tmpdir="$2"
 
-	if [[ "$(brg_store_backend)" == "sqlite" ]]; then
-		sqlite_materialize_latest_par2_set_for_file "$file" "$tmpdir"
+	if [[ "$(brg_store_backend_for_path "$file")" == "sqlite" ]]; then
+		local db
+		db=$(brg_store_db_path_for_path "$file")
+		BRG_PAR2_DB_PATH="$db" sqlite_materialize_latest_par2_set_for_file "$file" "$tmpdir"
 	else
 		return 2
 	fi
@@ -529,8 +853,10 @@ brg_store_materialize_latest_par2_set_for_file() {
 brg_store_clear_for_file() {
 	local file="$1"
 
-	if [[ "$(brg_store_backend)" == "sqlite" ]]; then
-		sqlite_store_clear_for_file "$file"
+	if [[ "$(brg_store_backend_for_path "$file")" == "sqlite" ]]; then
+		local db
+		db=$(brg_store_db_path_for_path "$file")
+		BRG_PAR2_DB_PATH="$db" sqlite_store_clear_for_file "$file"
 	else
 		return 2
 	fi
@@ -539,8 +865,10 @@ brg_store_clear_for_file() {
 brg_store_latest_mtime_for_file() {
 	local file="$1"
 
-	if [[ "$(brg_store_backend)" == "sqlite" ]]; then
-		sqlite_store_latest_mtime_for_file "$file"
+	if [[ "$(brg_store_backend_for_path "$file")" == "sqlite" ]]; then
+		local db
+		db=$(brg_store_db_path_for_path "$file")
+		BRG_PAR2_DB_PATH="$db" sqlite_store_latest_mtime_for_file "$file"
 	else
 		return 2
 	fi
@@ -812,7 +1140,7 @@ sqlite_clear_scope() {
 
 brg_store_prune_scope() {
 	local target="$1"
-	if [[ "$(brg_store_backend)" == "sqlite" ]]; then
+	if [[ "$(brg_store_backend_for_path "$target")" == "sqlite" ]]; then
 		sqlite_prune_missing_sources "$target"
 	else
 		filesystem_prune_orphaned_par2s "$target"
@@ -821,7 +1149,7 @@ brg_store_prune_scope() {
 
 brg_store_clear_scope() {
 	local target="$1"
-	if [[ "$(brg_store_backend)" == "sqlite" ]]; then
+	if [[ "$(brg_store_backend_for_path "$target")" == "sqlite" ]]; then
 		sqlite_clear_scope "$target"
 		if [[ -d "$target" ]]; then
 			while IFS= read -r -d '' marker; do
@@ -1269,7 +1597,7 @@ process_single_file() {
 				return 0
 			fi
 
-			if [[ "$(brg_store_backend)" == "sqlite" ]]; then
+			if [[ "$(brg_store_backend_for_path "$file")" == "sqlite" ]]; then
 				if ! brg_store_create_for_file "$file"; then
 					return 1
 				fi
@@ -1345,7 +1673,7 @@ process_single_file() {
 
 		verify)
 			log_verbose "Verifying: $file"
-			if [[ "$(brg_store_backend)" == "sqlite" ]]; then
+			if [[ "$(brg_store_backend_for_path "$file")" == "sqlite" ]]; then
 				local tmpdir main_par2
 				if ! tmpdir=$(mktemp -d --tmpdir "brg_par2_verify.XXXXXX"); then
 					echo "Error: Failed to create temporary directory for sqlite par2 verify" >&2
@@ -1417,7 +1745,7 @@ process_single_file() {
 
 		repair)
 			log_verbose "Repairing: $file"
-			if [[ "$(brg_store_backend)" == "sqlite" ]]; then
+			if [[ "$(brg_store_backend_for_path "$file")" == "sqlite" ]]; then
 				local tmpdir main_par2
 				if ! tmpdir=$(mktemp -d --tmpdir "brg_par2_repair.XXXXXX"); then
 					echo "Error: Failed to create temporary directory for sqlite par2 repair" >&2
@@ -1485,7 +1813,7 @@ process_single_file() {
 
 		clear)
 			log_verbose "Clearing protection for: $file"
-			if [[ "$(brg_store_backend)" == "sqlite" ]]; then
+			if [[ "$(brg_store_backend_for_path "$file")" == "sqlite" ]]; then
 				if ! brg_store_clear_for_file "$file"; then
 					return 1
 				fi
@@ -1507,7 +1835,7 @@ process_single_file() {
 				return $?
 			fi
 
-			if [[ "$(brg_store_backend)" == "sqlite" ]]; then
+			if [[ "$(brg_store_backend_for_path "$file")" == "sqlite" ]]; then
 				local file_time stored_time
 				file_time=$($STAT -c%Y "$file")
 				stored_time=$(brg_store_latest_mtime_for_file "$file" 2>/dev/null || true)
@@ -1571,7 +1899,7 @@ process_single_file() {
 				((total_size += rsrc_size))
 			fi
 
-			if [[ "$(brg_store_backend)" == "sqlite" ]]; then
+			if [[ "$(brg_store_backend_for_path "$file")" == "sqlite" ]]; then
 				local stored_time
 				stored_time=$(brg_store_latest_mtime_for_file "$file" 2>/dev/null || true)
 				if [[ -n "${stored_time:-}" ]]; then
@@ -2105,6 +2433,27 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
 			fi
 			queue_files_command "$mode" "$target"
 			exit $?
+			;;
+		config)
+			subcommand="${2:-}"
+			case "$subcommand" in
+				set-store)
+					shift 2
+					if ! brg_store_config_set_store "$@"; then
+						exit 1
+					fi
+					exit 0
+					;;
+				list-stores)
+					brg_store_config_list_stores
+					exit $?
+					;;
+				*)
+					echo -ne "Error: Unknown config subcommand '$subcommand'.\n\n" >&2
+					show_help
+					exit 1
+					;;
+			esac
 			;;
 		create|update|verify|repair|clear|stats|prune)
 			if [[ -z "$directory" ]]; then
