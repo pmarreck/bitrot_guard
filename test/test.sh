@@ -1189,6 +1189,29 @@ test_resource_fork_handling() {
 }
 [[ "$OSTYPE" == darwin* ]] && register_test test_resource_fork_handling
 
+test_sqlite_verify_does_not_leak_resource_fork_tmpdir() {
+	[[ "$OSTYPE" == darwin* ]] || { log "Skipping sqlite resource fork leak test on non-macOS"; return 0; }
+	log "test_sqlite_verify_does_not_leak_resource_fork_tmpdir"
+	local dir file rsrc_path tmpdir db leaked
+	dir=$(make_temp_dir)
+	file="$dir/sqlite-rsrc.txt"
+	rsrc_path="$file/..namedfork/rsrc"
+	tmpdir=$(make_temp_dir)
+	db="$dir/par2.sqlite3"
+
+	echo "Main content" > "$file"
+	echo "Resource fork content" > "$rsrc_path"
+
+	TMPDIR="$tmpdir" BRG_PAR2_STORE=sqlite BRG_PAR2_DB_PATH="$db" "$TARGET_BIN" verify "$file" >/dev/null 2>&1 || true
+
+	leaked=$(find "$tmpdir" -maxdepth 1 -type d -name 'brg_rsrc.*' -print -quit)
+	if [[ -n "${leaked:-}" ]]; then
+		fail "Expected no leaked brg_rsrc temp dirs, found: $leaked"
+		return 1
+	fi
+}
+[[ "$OSTYPE" == darwin* ]] && register_test test_sqlite_verify_does_not_leak_resource_fork_tmpdir
+
 test_verbose_output() {
 	log "test_verbose_output"
 	local dir file output

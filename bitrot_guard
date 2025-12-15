@@ -1546,18 +1546,20 @@ should_process_file() {
 }
 
 # Process a single file for par2 operations
-process_single_file() {
-	local file="$1"
-	local operation="$2"
-	local root="${3:-}"
-	if ! should_process_file "$file" "$root"; then
-		return 0
-	fi
-	local file_dir
-	file_dir=$(dirname "$file")
-	local dir_time
-	dir_time=$($STAT -c%Y "$file_dir")
-	local base_name
+	process_single_file() {
+		local file="$1"
+		local operation="$2"
+		local root="${3:-}"
+		if ! should_process_file "$file" "$root"; then
+			return 0
+		fi
+		local backend
+		backend=$(brg_store_backend_for_path "$file")
+		local file_dir
+		file_dir=$(dirname "$file")
+		local dir_time
+		dir_time=$($STAT -c%Y "$file_dir")
+		local base_name
 	base_name=$(basename "$file")
 	local par2_file
 	par2_file=$(get_par2_path "$file")
@@ -1571,12 +1573,12 @@ process_single_file() {
 		has_rf=true
 	fi
 
-	if $has_rf; then
-		case "$operation" in
-			create|verify|repair)
-				local temp_rf_dir
-				if ! temp_rf_dir=$(mktemp -d --tmpdir "brg_rsrc.XXXXXX"); then
-					echo "Error: Failed to create temporary directory for resource fork of $file" >&2
+		if $has_rf && [[ "$backend" != "sqlite" ]]; then
+			case "$operation" in
+				create|verify|repair)
+					local temp_rf_dir
+					if ! temp_rf_dir=$(mktemp -d --tmpdir "brg_rsrc.XXXXXX"); then
+						echo "Error: Failed to create temporary directory for resource fork of $file" >&2
 					return 1
 				fi
 				local temp_resource_fork_path="$temp_rf_dir/$(get_resource_fork_temp_basename "$file")"
@@ -1585,11 +1587,11 @@ process_single_file() {
 	fi
 
 	case "$operation" in
-		create)
-			log_verbose "Creating protection for: $file"
-			local file_size file_time
-			file_size=$($STAT -c%s "$file") # NOTE: this is expected to be GNU stat!
-			file_time=$($STAT -c%Y "$file") # NOTE: this is expected to be GNU stat!
+			create)
+				log_verbose "Creating protection for: $file"
+				local file_size file_time
+				file_size=$($STAT -c%s "$file") # NOTE: this is expected to be GNU stat!
+				file_time=$($STAT -c%Y "$file") # NOTE: this is expected to be GNU stat!
 
 			if [[ "$file_size" -eq 0 ]]; then
 				local marker
@@ -1601,14 +1603,14 @@ process_single_file() {
 				return 0
 			fi
 
-			if [[ "$(brg_store_backend_for_path "$file")" == "sqlite" ]]; then
-				if ! brg_store_create_for_file "$file"; then
-					return 1
+				if [[ "$backend" == "sqlite" ]]; then
+					if ! brg_store_create_for_file "$file"; then
+						return 1
+					fi
+					echo "$file - Done."
+					$TOUCH -h --date="@$dir_time" "$file_dir"
+					return 0
 				fi
-				echo "$file - Done."
-				$TOUCH -h --date="@$dir_time" "$file_dir"
-				return 0
-			fi
 
 			if [[ -f "$par2_file" ]]; then
 				debug "Skipping $file: its par2 file already exists"
@@ -1675,13 +1677,13 @@ process_single_file() {
 			$TOUCH -h --date="@$dir_time" "$file_dir"
 			;;
 
-		verify)
-			log_verbose "Verifying: $file"
-			if [[ "$(brg_store_backend_for_path "$file")" == "sqlite" ]]; then
-				local tmpdir main_par2
-				if ! tmpdir=$(mktemp -d --tmpdir "brg_par2_verify.XXXXXX"); then
-					echo "Error: Failed to create temporary directory for sqlite par2 verify" >&2
-					return 1
+			verify)
+				log_verbose "Verifying: $file"
+				if [[ "$backend" == "sqlite" ]]; then
+					local tmpdir main_par2
+					if ! tmpdir=$(mktemp -d --tmpdir "brg_par2_verify.XXXXXX"); then
+						echo "Error: Failed to create temporary directory for sqlite par2 verify" >&2
+						return 1
 				fi
 				if ! main_par2=$(brg_store_materialize_latest_par2_set_for_file "$file" "$tmpdir"); then
 					rm -rf "$tmpdir"
@@ -1747,13 +1749,13 @@ process_single_file() {
 			# $TOUCH -h --date="@$dir_time" "$file_dir" # User requested to remove this for verify
 			;;
 
-		repair)
-			log_verbose "Repairing: $file"
-			if [[ "$(brg_store_backend_for_path "$file")" == "sqlite" ]]; then
-				local tmpdir main_par2
-				if ! tmpdir=$(mktemp -d --tmpdir "brg_par2_repair.XXXXXX"); then
-					echo "Error: Failed to create temporary directory for sqlite par2 repair" >&2
-					return 1
+			repair)
+				log_verbose "Repairing: $file"
+				if [[ "$backend" == "sqlite" ]]; then
+					local tmpdir main_par2
+					if ! tmpdir=$(mktemp -d --tmpdir "brg_par2_repair.XXXXXX"); then
+						echo "Error: Failed to create temporary directory for sqlite par2 repair" >&2
+						return 1
 				fi
 				if ! main_par2=$(brg_store_materialize_latest_par2_set_for_file "$file" "$tmpdir"); then
 					rm -rf "$tmpdir"
@@ -1815,35 +1817,35 @@ process_single_file() {
 			$TOUCH -h --date="@$dir_time" "$file_dir"
 			;;
 
-		clear)
-			log_verbose "Clearing protection for: $file"
-			if [[ "$(brg_store_backend_for_path "$file")" == "sqlite" ]]; then
-				if ! brg_store_clear_for_file "$file"; then
-					return 1
+			clear)
+				log_verbose "Clearing protection for: $file"
+				if [[ "$backend" == "sqlite" ]]; then
+					if ! brg_store_clear_for_file "$file"; then
+						return 1
+					fi
+					$TOUCH -h --date="@$dir_time" "$file_dir"
+					return 0
 				fi
-				$TOUCH -h --date="@$dir_time" "$file_dir"
-				return 0
-			fi
 
 			remove_par2_files_for_file "$file"
 			$TOUCH -h --date="@$dir_time" "$file_dir"
 			;;
 
-		update)
-			log_verbose "Checking for updates: $file"
-			local file_size
-			file_size=$($STAT -c%s "$file") # NOTE: this is expected to be GNU stat!
+			update)
+				log_verbose "Checking for updates: $file"
+				local file_size
+				file_size=$($STAT -c%s "$file") # NOTE: this is expected to be GNU stat!
 			if [[ "$file_size" -eq 0 ]]; then
 				process_single_file "$file" clear "$root"
 				process_single_file "$file" create "$root"
 				return $?
 			fi
 
-			if [[ "$(brg_store_backend_for_path "$file")" == "sqlite" ]]; then
-				local file_time stored_time
-				file_time=$($STAT -c%Y "$file")
-				stored_time=$(brg_store_latest_mtime_for_file "$file" 2>/dev/null || true)
-				if [[ -z "${stored_time:-}" ]]; then
+				if [[ "$backend" == "sqlite" ]]; then
+					local file_time stored_time
+					file_time=$($STAT -c%Y "$file")
+					stored_time=$(brg_store_latest_mtime_for_file "$file" 2>/dev/null || true)
+					if [[ -z "${stored_time:-}" ]]; then
 					process_single_file "$file" create "$root"
 					return $?
 				fi
@@ -1893,9 +1895,9 @@ process_single_file() {
 			fi
 			;;
 
-		stats)
-			local total_size=0
-			total_size=$($STAT -c%s "$file") # NOTE: this is expected to be GNU stat!
+			stats)
+				local total_size=0
+				total_size=$($STAT -c%s "$file") # NOTE: this is expected to be GNU stat!
 
 			if $has_rf; then
 				local rsrc_size
@@ -1903,11 +1905,11 @@ process_single_file() {
 				((total_size += rsrc_size))
 			fi
 
-			if [[ "$(brg_store_backend_for_path "$file")" == "sqlite" ]]; then
-				local stored_time
-				stored_time=$(brg_store_latest_mtime_for_file "$file" 2>/dev/null || true)
-				if [[ -n "${stored_time:-}" ]]; then
-					echo "$total_size:covered"
+				if [[ "$backend" == "sqlite" ]]; then
+					local stored_time
+					stored_time=$(brg_store_latest_mtime_for_file "$file" 2>/dev/null || true)
+					if [[ -n "${stored_time:-}" ]]; then
+						echo "$total_size:covered"
 				else
 					echo "$total_size:uncovered"
 				fi
