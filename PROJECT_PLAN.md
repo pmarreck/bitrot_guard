@@ -16,11 +16,21 @@
 6. Explore sqlite storage fallback when `readfile()/writefile()` are unavailable (spike).
    - Status: Planned.
    - Idea: evaluate `printable_binary` encoding pipeline and/or a small compiled helper for streaming inserts/extracts without giant SQL literals.
+7. Explore a “fork/xattr” parity backend (spike).
+   - Status: In progress (macOS experiments captured below).
+   - Goal: store parity on filesystems that support it (APFS first), and treat stripped forks/xattrs as “unprotected”.
 
 ## Notes
 
 - Keep the test harness (`test/test.sh`) as the single entry point for unit tests; use `./bitrot_guard --test` to run it so CLI code paths stay exercised.
 - Honor the TDD loop for any future behavior changes.
+
+## macOS xattrs/resource forks (2025-12-15)
+
+- `..namedfork/rsrc` (resource fork) supports at least `512MiB` on APFS in local tests.
+- macOS does not support arbitrary named forks via `..namedfork/<name>` (only `rsrc` worked).
+- `cp -a` preserved the resource fork in local tests; `zip` dropped it.
+- `tar` extraction failed with `tar: Special header too large: %llu` once the resource fork was `1MiB` (creation succeeded, extraction failed), so tar is not a safe transport for large forks/xattrs without additional validation.
 
 ## Concurrency evaluation (2025-11-12)
 
