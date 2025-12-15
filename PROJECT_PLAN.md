@@ -38,10 +38,20 @@
 
 ## macOS xattrs/resource forks (2025-12-15)
 
+### Resource fork (`com.apple.ResourceFork`)
+
 - `..namedfork/rsrc` (resource fork) supports at least `512MiB` on APFS in local tests.
 - macOS does not support arbitrary named forks via `..namedfork/<name>` (only `rsrc` worked).
 - `cp -a` preserved the resource fork in local tests; `zip` dropped it.
 - `tar` extraction failed with `tar: Special header too large: %llu` once the resource fork was `1MiB` (creation succeeded, extraction failed), so tar is not a safe transport for large forks/xattrs without additional validation.
+
+### Custom xattrs (non-resource-fork)
+
+- A normal user xattr (`user.brg.probe`) supported at least `512MiB` on APFS in local tests (set/get via a tiny `setxattr(2)` C probe; the `xattr` CLI isn’t practical for huge values due to argv size limits).
+- Preservation across common tools:
+  - `cp -a` preserved the custom xattr for the tested sizes (`64KiB`, `1MiB`).
+  - `zip` dropped the custom xattr (xattr missing after unzip) even at `64KiB`.
+  - `tar` preserved and extracted a `64KiB` custom xattr, but extraction failed once the xattr reached `878KiB` (OK at `877KiB`, fail at `878KiB`) with the same `Special header too large` error.
 
 ## Concurrency evaluation (2025-11-12)
 
