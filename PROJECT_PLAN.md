@@ -10,20 +10,31 @@
    - Status: Completed (create/verify/repair/update/clear support; db excluded from protection; CLI flags and env vars).
 4. Add a prune command for orphaned par2 data.
    - Status: Completed (filesystem: removes orphan `.par2` files; sqlite: removes rows whose source files are missing).
-5. Explore compression of stored par2 data (spike).
+5. Extract a backend-agnostic store interface (filesystem/sqlite ports).
+   - Status: Completed (core per-file operations now dispatch via `brg_store_*`).
+6. Explore compression of stored par2 data (spike).
    - Status: Planned.
    - Idea: build a zstd dictionary trained on existing `.par2` corpus; store `codec` + `dict_id` per blob; measure size/time wins.
-6. Explore sqlite storage fallback when `readfile()/writefile()` are unavailable (spike).
+7. Explore sqlite storage fallback when `readfile()/writefile()` are unavailable (spike).
    - Status: Planned.
    - Idea: evaluate `printable_binary` encoding pipeline and/or a small compiled helper for streaming inserts/extracts without giant SQL literals.
-7. Explore a “fork/xattr” parity backend (spike).
-   - Status: In progress (macOS experiments captured below).
+8. Explore a “fork/xattr” parity backend (spike).
+   - Status: Partially completed (macOS baseline experiments captured below).
    - Goal: store parity on filesystems that support it (APFS first), and treat stripped forks/xattrs as “unprotected”.
+9. Upgrade TOML store config to support multiple backends per scope (with `!backend` negation).
+   - Status: Planned.
+   - Goal: allow multiple backends (e.g., filesystem+sqlite), and selectively disable per-scope (e.g., `/Applications` disables filesystem).
 
 ## Notes
 
 - Keep the test harness (`test/test.sh`) as the single entry point for unit tests; use `./bitrot_guard --test` to run it so CLI code paths stay exercised.
 - Honor the TDD loop for any future behavior changes.
+
+## Current goals (next milestones)
+
+- Add new TOML config schema for multi-backend scopes and `!backend` negation; update `bitrot_guard config ...` commands and docs.
+- Add a third store backend “fork/xattr” (initially macOS/APFS) with safe size limits and clear “unprotected” semantics when metadata is stripped.
+- Consider optional compression for sqlite-stored parity (dictionary-trained zstd spike), while keeping corruption tolerance in mind.
 
 ## macOS xattrs/resource forks (2025-12-15)
 

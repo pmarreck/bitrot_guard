@@ -118,6 +118,12 @@ Commands:
 ## Limitations
 
 - Not a replacement for backups or RAID (won't help if entire drive fails)
+
+## Roadmap (near-term)
+
+- TOML config upgrade to support multiple backends per scope (including `!backend` negation).
+- Add a “fork/xattr” store backend (macOS first), with clear behavior when forks/xattrs are stripped by copies/archives.
+- Spike: optional compression for sqlite-stored parity blobs (likely dictionary-trained zstd).
 - Adds storage overhead (default 5%)
 - Requires manual verification/repair (no automatic monitoring)
 - Resource fork handling only available on macOS
