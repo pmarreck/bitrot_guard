@@ -2508,14 +2508,14 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
 
 	ensure_target_arg_provided "$@"
 
-	if [[ "$raw_command" == "--test" ]]; then
-		if [[ ! -x "$TEST_SCRIPT" ]]; then
-			echo "Error: Test suite not found at $TEST_SCRIPT" >&2
-			exit 1
+		if [[ "$raw_command" == "--test" ]]; then
+			if [[ ! -x "$TEST_SCRIPT" ]]; then
+				echo "Error: Test suite not found at $TEST_SCRIPT" >&2
+				exit 1
+			fi
+			QUIET=1 "$TEST_SCRIPT" "${BRG_TEST_BIN:-$0}"
+			exit $?
 		fi
-		QUIET=1 "$TEST_SCRIPT" "$0"
-		exit $?
-	fi
 
 	command="$raw_command"
 	# Allow subcommands to be prefixed with --
@@ -2540,14 +2540,14 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
 			show_about
 			exit 0
 			;;
-		test)
-			if [[ ! -x "$TEST_SCRIPT" ]]; then
-				echo "Error: Test suite not found at $TEST_SCRIPT" >&2
-				exit 1
-			fi
-			"$TEST_SCRIPT" "$0"
-			exit $?
-			;;
+			test)
+				if [[ ! -x "$TEST_SCRIPT" ]]; then
+					echo "Error: Test suite not found at $TEST_SCRIPT" >&2
+					exit 1
+				fi
+				"$TEST_SCRIPT" "${BRG_TEST_BIN:-$0}"
+				exit $?
+				;;
 		queue-plan)
 			queue_plan
 			exit $?

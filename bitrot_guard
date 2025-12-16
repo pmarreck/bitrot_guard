@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+ORIG0="$0"
 SELF="$0"
 while [[ -L "$SELF" ]]; do
 	link=$(readlink "$SELF") || break
@@ -12,4 +13,24 @@ while [[ -L "$SELF" ]]; do
 done
 
 SCRIPT_DIR="$(cd "$(dirname "$SELF")" && pwd -P)"
-exec "$SCRIPT_DIR/bitrot_guard.bash" "$@"
+
+case "${BRG_IMPL:-bash}" in
+	luajit)
+		luajit_bin="${BRG_LUAJIT_BIN:-}"
+		if [[ -z "${luajit_bin:-}" ]]; then
+			luajit_bin=$(command -v luajit 2>/dev/null || true)
+		fi
+		[[ -n "${luajit_bin:-}" ]] || { echo "Error: BRG_IMPL=luajit but luajit is not on PATH" >&2; exit 1; }
+		[[ -x "$luajit_bin" ]] || { echo "Error: BRG_LUAJIT_BIN is not executable: $luajit_bin" >&2; exit 1; }
+		[[ -x "$SCRIPT_DIR/bitrot_guard.luajit" ]] || { echo "Error: Missing $SCRIPT_DIR/bitrot_guard.luajit" >&2; exit 1; }
+		BRG_ARGV0="$ORIG0" BRG_TEST_BIN="$ORIG0" exec "$luajit_bin" "$SCRIPT_DIR/bitrot_guard.luajit" "$@"
+		;;
+	bash|"")
+		;;
+	*)
+		echo "Error: Unknown BRG_IMPL=${BRG_IMPL}" >&2
+		exit 1
+		;;
+esac
+
+BRG_TEST_BIN="$ORIG0" exec "$SCRIPT_DIR/bitrot_guard.bash" "$@"

@@ -1231,6 +1231,36 @@ test_verbose_output() {
 }
 register_test test_verbose_output
 
+test_luajit_impl_invokes_luajit() {
+	log "test_luajit_impl_invokes_luajit"
+	local real_luajit
+	real_luajit=$(command -v luajit || true)
+	[[ -n "${real_luajit:-}" ]] || { log "Skipping luajit impl test (luajit missing)"; return 0; }
+
+	local dir shim marker out
+	dir=$(make_temp_dir)
+	marker="$dir/luajit_called"
+	shim="$dir/luajit_shim"
+	{
+		printf '%s\n' '#!/usr/bin/env bash'
+		printf '%s\n' 'set -euo pipefail'
+		printf '%s\n' ": >\"$marker\""
+		printf '%s\n' "exec \"$real_luajit\" \"\$@\""
+	} >"$shim"
+	chmod +x "$shim"
+
+	out=$(BRG_IMPL=luajit BRG_LUAJIT_BIN="$shim" "$TARGET_BIN" about)
+	if [[ "$out" != "$EXPECTED_ABOUT" ]]; then
+		fail "About output mismatch under luajit impl: $out"
+		return 1
+	fi
+	if [[ ! -f "$marker" ]]; then
+		fail "Expected wrapper to invoke luajit when BRG_IMPL=luajit"
+		return 1
+	fi
+}
+register_test test_luajit_impl_invokes_luajit
+
 run_tests() {
 	local failed=0
 	for test in "${TESTS[@]}"; do
