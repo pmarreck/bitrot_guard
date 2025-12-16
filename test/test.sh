@@ -1261,6 +1261,25 @@ test_luajit_impl_invokes_luajit() {
 }
 register_test test_luajit_impl_invokes_luajit
 
+test_luajit_about_does_not_require_bash_script() {
+	log "test_luajit_about_does_not_require_bash_script"
+	command -v luajit >/dev/null 2>&1 || { log "Skipping luajit about test (luajit missing)"; return 0; }
+
+	local dir bin out
+	dir=$(make_temp_dir)
+	bin="$dir/bitrot_guard"
+	cp "$PROJECT_ROOT/bitrot_guard" "$bin"
+	cp "$PROJECT_ROOT/bitrot_guard.luajit" "$dir/bitrot_guard.luajit"
+	chmod +x "$bin" "$dir/bitrot_guard.luajit"
+
+	out=$(BRG_IMPL=luajit "$bin" about)
+	if [[ "$out" != "$EXPECTED_ABOUT" ]]; then
+		fail "About output mismatch without bash script: $out"
+		return 1
+	fi
+}
+register_test test_luajit_about_does_not_require_bash_script
+
 run_tests() {
 	local failed=0
 	for test in "${TESTS[@]}"; do

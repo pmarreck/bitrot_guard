@@ -25,6 +25,14 @@ end
 local script_dir = dirname(arg[0])
 local bash_path = script_dir .. "/bitrot_guard.bash"
 
+local ABOUT = "Bitrot Guard creates and uses par2 redundancy to detect and repair bitrot in your files and directories."
+
+local command = arg[1]
+if command == "about" or command == "-a" or command == "--about" then
+	io.write(ABOUT)
+	return
+end
+
 local argv0 = os.getenv("BRG_ARGV0")
 if argv0 == nil or argv0 == "" then
 	argv0 = bash_path
