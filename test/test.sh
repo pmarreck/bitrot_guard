@@ -345,6 +345,76 @@ test_cli_par2_store_sqlite_flags() {
 }
 register_test test_cli_par2_store_sqlite_flags
 
+test_cli_par2_bin_option_uses_custom_binary() {
+	log "test_cli_par2_bin_option_uses_custom_binary"
+	local real_par2
+	real_par2=$(command -v par2 || true)
+	[[ -n "${real_par2:-}" ]] || { log "Skipping par2 bin option test (par2 missing)"; return 0; }
+
+	local dir file marker shim out
+	dir=$(make_temp_dir)
+	file="$dir/custom_par2.txt"
+	echo "par2z test" > "$file"
+	marker="$dir/par2_called"
+	shim="$dir/par2_shim"
+	{
+		printf '%s\n' '#!/usr/bin/env bash'
+		printf '%s\n' 'set -euo pipefail'
+		printf '%s\n' ": >\"$marker\""
+		printf '%s\n' "exec \"$real_par2\" \"\$@\""
+	} >"$shim"
+	chmod +x "$shim"
+
+	out=$("$TARGET_BIN" --par2-bin "$shim" create "$file" 2>&1)
+	if [[ ! -f "$marker" ]]; then
+		fail "Expected --par2-bin to invoke custom par2 binary. Output: $out"
+		return 1
+	fi
+}
+register_test test_cli_par2_bin_option_uses_custom_binary
+
+test_create_stops_on_disk_full() {
+	log "test_create_stops_on_disk_full"
+	local dir file1 file2 shim marker out rc calls
+	dir=$(make_temp_dir)
+	file1="$dir/one.txt"
+	file2="$dir/two.txt"
+	echo "one" > "$file1"
+	echo "two" > "$file2"
+	marker="$dir/par2_calls"
+	shim="$dir/par2_shim"
+	{
+		printf '%s\n' '#!/usr/bin/env bash'
+		printf '%s\n' 'set -euo pipefail'
+		printf '%s\n' "echo called >>\"$marker\""
+		printf '%s\n' 'echo "No space left on device" >&2'
+		printf '%s\n' 'exit 1'
+	} >"$shim"
+	chmod +x "$shim"
+
+	set +e
+	out=$(BRG_PAR2_BIN="$shim" "$TARGET_BIN" create "$dir" 2>&1)
+	rc=$?
+	set -e
+	if [[ $rc -eq 0 ]]; then
+		fail "Expected create to fail on disk full"
+		return 1
+	fi
+	if [[ "$out" != *"Disk full"* && "$out" != *"disk full"* ]]; then
+		fail "Expected disk full error message, got: $out"
+		return 1
+	fi
+	calls=0
+	if [[ -f "$marker" ]]; then
+		calls=$(wc -l <"$marker" | $AWK '{print $1}')
+	fi
+	if [[ "$calls" -ne 1 ]]; then
+		fail "Expected par2 to be invoked once after disk full, got $calls"
+		return 1
+	fi
+}
+register_test test_create_stops_on_disk_full
+
 test_sqlite_store_clear_removes_entries() {
 	log "test_sqlite_store_clear_removes_entries"
 	local dir file db before after

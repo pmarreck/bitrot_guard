@@ -27,6 +27,29 @@ resolve_script_dir() {
 SCRIPT_DIR=$(resolve_script_dir)
 TEST_SCRIPT="$SCRIPT_DIR/test/test.sh"
 
+BRG_PAR2_BIN=${BRG_PAR2_BIN:-}
+
+preparse_par2_bin() {
+	local prev=""
+	for arg in "$@"; do
+		if [[ -n "$prev" ]]; then
+			BRG_PAR2_BIN="$arg"
+			prev=""
+			continue
+		fi
+		case "$arg" in
+			--par2-bin=*|--par2-path=*|--par2-command=*)
+				BRG_PAR2_BIN="${arg#*=}"
+				;;
+			--par2-bin|--par2-path|--par2-command)
+				prev="$arg"
+				;;
+		esac
+	done
+}
+
+preparse_par2_bin "$@"
+
 queue_plan() {
 	local workers=${BRG_WORKERS:-$(get_cpu_cores)}
 	if ! [[ "$workers" =~ ^[0-9]+$ ]] || ((workers < 1)); then
@@ -321,6 +344,18 @@ resolve_realpath() {
 	return 1
 }
 
+brg_is_disk_full_error() {
+	local output="$1"
+	local lower
+	lower=$(printf '%s' "$output" | tr '[:upper:]' '[:lower:]')
+	case "$lower" in
+		*"no space left on device"*|*"disk full"*|*"enospc"*)
+			return 0
+			;;
+	esac
+	return 1
+}
+
 # Set number of par2 threads, allowing override via environment variable
 : "${NUM_PAR2_THREADS:=$(get_cpu_cores)}"
 VERBOSE=${VERBOSE:-0}
@@ -359,6 +394,7 @@ declare -a DEFAULT_IGNORE_PATTERNS=(
 )
 BRG_IGNORE_PATTERNS_LOADED=0
 declare -a BRG_IGNORE_PATTERNS_CACHE=()
+BRG_RC_DISK_FULL=3
 
 # Warn if redundancy is set too high
 if ((BRG_REDUNDANCY > 20)); then
@@ -390,6 +426,8 @@ check_dependencies() {
 	# warn if par2 missing
 	if [ -z "$PAR2" ]; then
 		missing+=("par2")
+	elif ! command -v "$PAR2" >/dev/null 2>&1 && [[ ! -x "$PAR2" ]]; then
+		missing+=("par2")
 	fi
 	if ! realpath_supported; then
 		missing+=("greadlink (coreutils) or readlink")
@@ -419,6 +457,9 @@ export AWK=${AWK:-$(setup_awk)}
 export TOUCH=${TOUCH:-$(command -v gtouch || command -v touch)}
 export STAT=${STAT:-$(command -v gstat || command -v stat)}
 export SED=${SED:-$(command -v gsed || command -v sed)}
+if [[ -n "${BRG_PAR2_BIN:-}" ]]; then
+	PAR2="$BRG_PAR2_BIN"
+fi
 export PAR2=${PAR2:-$(command -v par2)}
 check_dependencies
 
@@ -891,8 +932,16 @@ filesystem_store_create_for_file() {
 
 	remove_par2_files_for_file "$file"
 
-	if ! $PAR2 create -s"$block_size" -r"$BRG_REDUNDANCY" -n1 -T"$NUM_PAR2_THREADS" -a "$par2_file" "$file" >/dev/null; then
+	local par2_output
+	if ! par2_output=$($PAR2 create -s"$block_size" -r"$BRG_REDUNDANCY" -n1 -T"$NUM_PAR2_THREADS" -a "$par2_file" "$file" 2>&1); then
+		if brg_is_disk_full_error "$par2_output"; then
+			echo "Disk full while creating par2 for $file" >&2
+			return "$BRG_RC_DISK_FULL"
+		fi
 		echo -e "\nError creating par2 for $file" >&2
+		if [[ -n "$par2_output" ]]; then
+			echo "$par2_output" >&2
+		fi
 		return 1
 	fi
 
@@ -932,8 +981,17 @@ filesystem_store_create_for_file() {
 		rf_block_size=$(calculate_block_size "$rf_size")
 		temp_rf_dir_real=$(dirname "$temp_resource_fork_path")
 
-		if ! $PAR2 create -s"$rf_block_size" -r"$BRG_REDUNDANCY" -n1 -T"$NUM_PAR2_THREADS" -B "$temp_rf_dir_real" -a "$resource_fork_par2_file" "$temp_resource_fork_path" >/dev/null; then
+		local rf_output
+		if ! rf_output=$($PAR2 create -s"$rf_block_size" -r"$BRG_REDUNDANCY" -n1 -T"$NUM_PAR2_THREADS" -B "$temp_rf_dir_real" -a "$resource_fork_par2_file" "$temp_resource_fork_path" 2>&1); then
+			if brg_is_disk_full_error "$rf_output"; then
+				echo "Disk full while creating par2 for resource fork of $file" >&2
+				rm -rf "$temp_rf_dir"
+				return "$BRG_RC_DISK_FULL"
+			fi
 			echo -e "\nError creating par2 for resource fork of $file of length $rf_size" >&2
+			if [[ -n "$rf_output" ]]; then
+				echo "$rf_output" >&2
+			fi
 			rm -rf "$temp_rf_dir"
 			return 1
 		fi
@@ -1246,9 +1304,17 @@ sqlite_store_create_for_file() {
 	file_size=$($STAT -c%s "$file")
 	block_size=$(calculate_block_size "$file_size")
 
-	if ! $PAR2 create -B"$file_dir" -s"$block_size" -r"$BRG_REDUNDANCY" -n1 -T"$NUM_PAR2_THREADS" "$tmp_par2_base" "$file" >/dev/null; then
+	local par2_output
+	if ! par2_output=$($PAR2 create -B"$file_dir" -s"$block_size" -r"$BRG_REDUNDANCY" -n1 -T"$NUM_PAR2_THREADS" "$tmp_par2_base" "$file" 2>&1); then
 		rm -rf "$tmpdir"
+		if brg_is_disk_full_error "$par2_output"; then
+			echo "Disk full while creating par2 for $file" >&2
+			return "$BRG_RC_DISK_FULL"
+		fi
 		echo -e "\nError creating par2 for $file" >&2
+		if [[ -n "$par2_output" ]]; then
+			echo "$par2_output" >&2
+		fi
 		return 1
 	fi
 
@@ -2043,13 +2109,18 @@ create_par2s() {
 		return 1
 	fi
 
+	local rc=0
 	while IFS= read -r -d '' file; do
 		if should_ignore_path "$file" "$target"; then
 			debug "Skipping ignored path during create: $file"
 			continue
 		fi
 		debug "Creating protection for $file in directory: $target"
-		process_single_file "$file" create "$target"
+		rc=0
+		process_single_file "$file" create "$target" || rc=$?
+		if [[ "$rc" -eq "$BRG_RC_DISK_FULL" ]]; then
+			return "$rc"
+		fi
 	done < <(find "$target" -type f -not -name "*.par2" -print0)
 }
 
@@ -2405,6 +2476,8 @@ Environment Variables:
   BRG_IGNORE_PATTERNS  Colon-separated glob patterns to skip (works like PATH).
 					Defaults to ignoring .git/.jj directories (including nested ones).
 					Example: BRG_IGNORE_PATTERNS="*.bak:node_modules/**" ./${cmd_name} update /path
+  BRG_PAR2_BIN      Path to par2-compatible binary (overrides PATH lookup).
+					Example: BRG_PAR2_BIN=./bin/macos/par2z-cli ./${cmd_name} create /path/to/dir
   BRG_PAR2_STORE     Par2 storage backend: auto (default), filesystem, or sqlite.
 					Example: BRG_PAR2_STORE=sqlite ./${cmd_name} create /path/to/dir
   BRG_PAR2_DB_PATH   Path to sqlite db when BRG_PAR2_STORE=sqlite or when a store rule uses sqlite without an explicit db_path.
@@ -2457,17 +2530,32 @@ EOF
 # Main execution (if script is run directly)
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
 	# Parse recognized flags first
-	while [[ $# -gt 0 ]]; do
-		case "$1" in
-			-v|--verbose)
-				VERBOSE=1
-				shift
-				;;
-			--par2-store)
-				shift
-				if [[ $# -lt 1 || -z "${1:-}" ]]; then
-					echo "Error: --par2-store requires a value (filesystem|sqlite)." >&2
-					exit 1
+		while [[ $# -gt 0 ]]; do
+			case "$1" in
+				-v|--verbose)
+					VERBOSE=1
+					shift
+					;;
+				--par2-bin|--par2-path|--par2-command)
+					shift
+					if [[ $# -lt 1 || -z "${1:-}" ]]; then
+						echo "Error: --par2-bin requires a path." >&2
+						exit 1
+					fi
+					BRG_PAR2_BIN="$1"
+					PAR2="$BRG_PAR2_BIN"
+					shift
+					;;
+				--par2-bin=*|--par2-path=*|--par2-command=*)
+					BRG_PAR2_BIN="${1#*=}"
+					PAR2="$BRG_PAR2_BIN"
+					shift
+					;;
+				--par2-store)
+					shift
+					if [[ $# -lt 1 || -z "${1:-}" ]]; then
+						echo "Error: --par2-store requires a value (filesystem|sqlite)." >&2
+						exit 1
 				fi
 				BRG_PAR2_STORE="$1"
 				shift
