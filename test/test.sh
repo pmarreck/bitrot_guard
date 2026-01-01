@@ -415,6 +415,43 @@ test_create_stops_on_disk_full() {
 }
 register_test test_create_stops_on_disk_full
 
+test_create_insufficient_space_fails_noninteractive() {
+	log "test_create_insufficient_space_fails_noninteractive"
+	local dir file stub_dir stub_df out rc
+	dir=$(make_temp_dir)
+	file="$dir/space_check.txt"
+	head -c 2048 </dev/zero > "$file"
+
+	stub_dir=$(mktemp -d --tmpdir brg_df_stub.XXXXXX)
+	TEMP_DIRS+=("$stub_dir")
+	stub_df="$stub_dir/df"
+	cat >"$stub_df" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "Filesystem 1024-blocks Used Available Capacity Mounted on"
+printf '%s\n' "/dev/disk1s1 1024 1024 0 100% /"
+EOF
+	chmod +x "$stub_df"
+
+	set +e
+	out=$(PATH="$stub_dir:$PATH" BRG_REDUNDANCY=10 "$TARGET_BIN" create "$file" </dev/null 2>&1)
+	rc=$?
+	set -e
+	if [[ "$rc" -eq 0 ]]; then
+		fail "Expected create to fail when space is insufficient in non-interactive mode"
+		return 1
+	fi
+	if [[ "$out" != *"insufficient"* && "$out" != *"Insufficient"* ]]; then
+		fail "Expected insufficient space error, got: $out"
+		return 1
+	fi
+	if [[ "$out" != *"TTY"* && "$out" != *"tty"* ]]; then
+		fail "Expected non-interactive/TTY error, got: $out"
+		return 1
+	fi
+	expect_par2_absent "$dir"
+}
+register_test test_create_insufficient_space_fails_noninteractive
+
 test_sqlite_store_clear_removes_entries() {
 	log "test_sqlite_store_clear_removes_entries"
 	local dir file db before after

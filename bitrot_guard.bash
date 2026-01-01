@@ -356,6 +356,105 @@ brg_is_disk_full_error() {
 	return 1
 }
 
+brg_redundancy_bytes_for_size() {
+	local size="$1"
+	if (( size <= 0 || BRG_REDUNDANCY <= 0 )); then
+		printf '%s\n' 0
+		return 0
+	fi
+	local required
+	required=$(( (size * BRG_REDUNDANCY + BRG_PERCENT_CEIL) / BRG_PERCENT_BASE ))
+	if (( required <= 0 )); then
+		required=1
+	fi
+	printf '%s\n' "$required"
+}
+
+brg_existing_path_for_df() {
+	local path="$1"
+	local current="$path"
+	while [[ -n "$current" && ! -e "$current" ]]; do
+		local parent
+		parent=$(dirname "$current")
+		if [[ "$parent" == "$current" ]]; then
+			break
+		fi
+		current="$parent"
+	done
+	printf '%s\n' "$current"
+}
+
+brg_df_volume_info_for_path() {
+	local path="$1"
+	local probe
+	probe=$(brg_existing_path_for_df "$path")
+	[[ -n "$probe" ]] || return 1
+	df -P "$probe" 2>/dev/null | $AWK 'NR==2 {print $NF "\t" $(NF-2)}'
+}
+
+brg_check_redundancy_space_for_file() {
+	local file="$1"
+	local backend="$2"
+	local check_path="$file"
+	if [[ "$backend" == "sqlite" ]]; then
+		local db_path
+		db_path=$(brg_store_db_path_for_path "$file")
+		check_path=$(dirname "$db_path")
+	fi
+
+	local info
+	if ! info=$(brg_df_volume_info_for_path "$check_path"); then
+		return 0
+	fi
+
+	local mount avail_kb
+	mount=${info%%$'\t'*}
+	avail_kb=${info##*$'\t'}
+	if [[ -z "$mount" || -z "$avail_kb" ]]; then
+		return 0
+	fi
+	local avail_bytes
+	avail_bytes=$((avail_kb * BRG_DF_BLOCK_BYTES))
+
+	local file_size total_size
+	file_size=$($STAT -c%s "$file")
+	total_size=$file_size
+	if has_resource_fork "$file"; then
+		local resource_fork_path rsrc_size
+		resource_fork_path=$(get_resource_fork_path "$file")
+		rsrc_size=$($STAT -c%s "$resource_fork_path")
+		(( total_size += rsrc_size ))
+	fi
+
+	local required_bytes
+	required_bytes=$(brg_redundancy_bytes_for_size "$total_size")
+	if (( required_bytes <= 0 )); then
+		return 0
+	fi
+	if (( avail_bytes >= required_bytes )); then
+		return 0
+	fi
+	if [[ -n "${BRG_VOLUME_CONFIRMED[$mount]+x}" ]]; then
+		return 0
+	fi
+	if [[ ! -t 0 ]]; then
+		echo "Error: Insufficient free space on volume $mount for ${BRG_REDUNDANCY}% redundancy (need ${required_bytes} bytes, have ${avail_bytes} bytes). Run in a TTY to confirm." >&2
+		return 1
+	fi
+
+	echo "Warning: Insufficient free space on volume $mount for ${BRG_REDUNDANCY}% redundancy (need ${required_bytes} bytes, have ${avail_bytes} bytes)." >&2
+	echo -n "Continue anyway? [y/N] " >&2
+	local answer
+	read -r answer
+	case "$answer" in
+		y|Y|yes|YES|Yes)
+			BRG_VOLUME_CONFIRMED["$mount"]=1
+			return 0
+			;;
+	esac
+	return 1
+}
+
 # Set number of par2 threads, allowing override via environment variable
 : "${NUM_PAR2_THREADS:=$(get_cpu_cores)}"
 VERBOSE=${VERBOSE:-0}
@@ -395,6 +494,11 @@ declare -a DEFAULT_IGNORE_PATTERNS=(
 BRG_IGNORE_PATTERNS_LOADED=0
 declare -a BRG_IGNORE_PATTERNS_CACHE=()
 BRG_RC_DISK_FULL=3
+BRG_RC_INSUFFICIENT_SPACE=4
+BRG_DF_BLOCK_BYTES=1024
+BRG_PERCENT_BASE=100
+BRG_PERCENT_CEIL=99
+declare -A BRG_VOLUME_CONFIRMED=()
 
 # Warn if redundancy is set too high
 if ((BRG_REDUNDANCY > 20)); then
@@ -1942,6 +2046,10 @@ process_single_file() {
 				return 0
 				fi
 
+				if ! brg_check_redundancy_space_for_file "$file" "$backend"; then
+					return "$BRG_RC_INSUFFICIENT_SPACE"
+				fi
+
 				local rc=0
 				brg_store_create_for_file "$file" || rc=$?
 				if [[ "$rc" -eq 2 ]]; then
@@ -2118,7 +2226,7 @@ create_par2s() {
 		debug "Creating protection for $file in directory: $target"
 		rc=0
 		process_single_file "$file" create "$target" || rc=$?
-		if [[ "$rc" -eq "$BRG_RC_DISK_FULL" ]]; then
+		if [[ "$rc" -eq "$BRG_RC_DISK_FULL" || "$rc" -eq "$BRG_RC_INSUFFICIENT_SPACE" ]]; then
 			return "$rc"
 		fi
 	done < <(find "$target" -type f -not -name "*.par2" -print0)
